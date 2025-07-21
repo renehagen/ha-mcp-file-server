@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "home-assistant-files": {
+      "transport": {
+        "type": "http",
+        "url": "http://homeassistant.local:6789/api/mcp"
+      },
+      "description": "Home Assistant file management server with AI-powered automation capabilities"
+    }
+  }
+}

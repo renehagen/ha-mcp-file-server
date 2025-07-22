@@ -132,6 +132,18 @@ Unlike generic AI assistants that give general advice, this MCP server gives AI 
 
 This transforms AI from a general helper into a **personalized Home Assistant expert** that knows your system inside and out.
 
+## ⚠️ IMPORTANT SECURITY WARNING
+
+**AI systems can make mistakes and potentially cause harm to your Home Assistant configuration.** Before using this MCP server:
+
+- **ALWAYS have a complete backup** of your Home Assistant configuration before allowing AI write access
+- **Start with read-only mode** (`read_only: true`) to test functionality safely
+- **Test with non-critical systems first** before giving AI access to important automations
+- **Review AI-suggested changes** carefully before applying them to production systems
+- **Monitor AI actions** and be prepared to restore from backup if needed
+
+AI can be incredibly helpful, but it's not infallible. Your backup is your safety net.
+
 ## Security
 
 - Always use an API key in production

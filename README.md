@@ -39,14 +39,18 @@ http://homeassistant.local:6789/api/mcp
 
 ### Example Client Configuration
 
-**For Claude Code:**
+**For Claude Code CLI:**
 ```bash
-# Without API key
-claude mcp add ha-files http://homeassistant.local:6789/api/mcp
+# Without API key (use IP address if homeassistant.local doesn't resolve)
+claude mcp add ha-files http://homeassistant.local:6789/api/mcp --transport http
+# or
+claude mcp add ha-files http://192.168.1.93:6789/api/mcp --transport http
 
 # With API key
-claude mcp add ha-files "http://homeassistant.local:6789/api/mcp?code=YOUR_API_KEY"
+claude mcp add ha-files "http://homeassistant.local:6789/api/mcp?code=YOUR_API_KEY" --transport http
 ```
+
+**Note:** The `--transport http` flag is required for Claude Code CLI to properly recognize this as an HTTP-based MCP server.
 
 **For Claude Desktop or other MCP clients:**
 ```json

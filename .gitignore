@@ -56,3 +56,5 @@ coverage.xml
 # Home Assistant
 config/
 .storage/
+changed-files/
+backup-files/

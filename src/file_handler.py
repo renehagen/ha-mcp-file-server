@@ -5,6 +5,7 @@ import asyncio
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import logging
+from collections import deque
 
 logger = logging.getLogger(__name__)
 
@@ -183,5 +184,74 @@ class FileHandler:
         
         # Filter out None results and limit
         results = [r for r in search_results if r is not None][:max_results]
+        
+        return results
+    
+    async def read_file_filtered(self, path: str, filter_pattern: Optional[str] = None, 
+                                 tail_lines: Optional[int] = None, max_lines: int = 1000) -> Dict[str, Any]:
+        """Read file with filtering support for large files."""
+        file_path = self._validate_path(path)
+        
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        
+        if not file_path.is_file():
+            raise ValueError(f"Path is not a file: {path}")
+        
+        results = {
+            "path": str(file_path),
+            "total_lines": 0,
+            "matched_lines": 0,
+            "lines": []
+        }
+        
+        try:
+            # If tail_lines is specified, we need to read from the end
+            if tail_lines:
+                # Use deque to keep only the last N lines
+                line_buffer = deque(maxlen=tail_lines)
+                
+                async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                    line_num = 0
+                    async for line in f:
+                        line_num += 1
+                        if not filter_pattern or filter_pattern.lower() in line.lower():
+                            line_buffer.append({
+                                "line_number": line_num,
+                                "content": line.rstrip()
+                            })
+                    
+                    results["total_lines"] = line_num
+                    results["matched_lines"] = len(line_buffer)
+                    results["lines"] = list(line_buffer)[-max_lines:]
+            
+            else:
+                # Read from beginning with filtering
+                async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                    line_num = 0
+                    matched = 0
+                    
+                    async for line in f:
+                        line_num += 1
+                        if not filter_pattern or filter_pattern.lower() in line.lower():
+                            if matched < max_lines:
+                                results["lines"].append({
+                                    "line_number": line_num,
+                                    "content": line.rstrip()
+                                })
+                            matched += 1
+                    
+                    results["total_lines"] = line_num
+                    results["matched_lines"] = matched
+            
+            # Add summary info
+            if filter_pattern:
+                results["filter_pattern"] = filter_pattern
+            if tail_lines:
+                results["tail_lines"] = tail_lines
+            results["returned_lines"] = len(results["lines"])
+            
+        except UnicodeDecodeError:
+            raise ValueError(f"Cannot filter binary file: {path}")
         
         return results

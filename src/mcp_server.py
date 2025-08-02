@@ -30,7 +30,7 @@ else:
     ALLOWED_DIRS = []
 
 # Initialize FastAPI app
-app = FastAPI(title="MCP File Server", version="1.0.0")
+app = FastAPI(title="MCP File Server", version="1.1.0")
 
 # Initialize file handler
 file_handler = FileHandler(
@@ -72,7 +72,7 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                     },
                     "serverInfo": {
                         "name": "ha-mcp-file-server",
-                        "version": "1.0.0"
+                        "version": "1.1.0"
                     }
                 }
             )
@@ -146,6 +146,20 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                         },
                         "required": ["path", "pattern"]
                     }
+                },
+                {
+                    "name": "read_file_filtered",
+                    "description": "Read file with filtering support for large files",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "path": {"type": "string", "description": "File path to read"},
+                            "filter_pattern": {"type": "string", "description": "Text pattern to filter lines (case-insensitive)"},
+                            "tail_lines": {"type": "integer", "description": "Number of lines from end of file to process"},
+                            "max_lines": {"type": "integer", "description": "Maximum number of lines to return (default: 1000)"}
+                        },
+                        "required": ["path"]
+                    }
                 }
             ]
             return JsonRpcResponse(
@@ -187,6 +201,15 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                 results = await file_handler.search_files(arguments["path"], arguments["pattern"])
                 result = {"content": [{"type": "text", "text": json.dumps(results, indent=2)}]}
                 
+            elif tool_name == "read_file_filtered":
+                results = await file_handler.read_file_filtered(
+                    arguments["path"],
+                    filter_pattern=arguments.get("filter_pattern"),
+                    tail_lines=arguments.get("tail_lines"),
+                    max_lines=arguments.get("max_lines", 1000)
+                )
+                result = {"content": [{"type": "text", "text": json.dumps(results, indent=2)}]}
+                
             else:
                 raise ValueError(f"Unknown tool: {tool_name}")
             
@@ -220,7 +243,7 @@ async def mcp_get_endpoint(code: str = Query(None)):
     
     return {
         "name": "Home Assistant MCP File Server",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "description": "File management server for Home Assistant",
         "protocol": "MCP 2024-11-05",
         "transport": "HTTP",
@@ -256,13 +279,13 @@ async def mcp_post_endpoint(
             for req_data in body:
                 req = JsonRpcRequest(**req_data)
                 resp = await handle_mcp_request(req)
-                responses.append(resp.dict(exclude_none=True))
+                responses.append(resp.model_dump(exclude_none=True))
             return responses
         else:
             # Single request
             req = JsonRpcRequest(**body)
             resp = await handle_mcp_request(req)
-            return resp.dict(exclude_none=True)
+            return resp.model_dump(exclude_none=True)
     
     except Exception as e:
         logger.error(f"Error processing MCP request: {e}")
@@ -279,7 +302,7 @@ async def mcp_post_endpoint(
 async def health_check():
     return {
         "status": "healthy",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "read_only": READ_ONLY,
         "allowed_dirs": ALLOWED_DIRS,
         "mcp_endpoint": "/api/mcp"

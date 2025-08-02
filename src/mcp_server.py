@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import subprocess
+import asyncio
 from typing import Dict, List, Any, Optional, Union
 from fastapi import FastAPI, HTTPException, Request, Query
 from pydantic import BaseModel
@@ -8,6 +10,7 @@ import uvicorn
 from datetime import datetime
 
 from file_handler import FileHandler
+from supervisor_api import SupervisorAPI
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +21,7 @@ PORT = int(os.getenv("MCP_PORT", "6789"))
 API_KEY = os.getenv("MCP_API_KEY", "")
 READ_ONLY = os.getenv("MCP_READ_ONLY", "false").lower() == "true"
 MAX_FILE_SIZE_MB = int(os.getenv("MCP_MAX_FILE_SIZE_MB", "10"))
+ENABLE_HA_CLI = os.getenv("MCP_ENABLE_HA_CLI", "false").lower() == "true"
 
 # Parse allowed directories - bashio provides them as newline-separated values
 allowed_dirs_env = os.getenv("MCP_ALLOWED_DIRS", "")
@@ -30,7 +34,7 @@ else:
     ALLOWED_DIRS = []
 
 # Initialize FastAPI app
-app = FastAPI(title="MCP File Server", version="1.1.0")
+app = FastAPI(title="MCP File Server", version="1.2.0")
 
 # Initialize file handler
 file_handler = FileHandler(
@@ -58,6 +62,81 @@ def verify_function_key(code: str):
         raise HTTPException(status_code=401, detail="Invalid function key")
     return True
 
+async def execute_ha_cli_command(command: str, timeout: int = 30) -> Dict[str, Any]:
+    """Execute HA CLI command using Supervisor API."""
+    
+    if not ENABLE_HA_CLI:
+        raise Exception("HA CLI commands are disabled")
+    
+    # Safety validation - only allow specific safe commands
+    allowed_commands = [
+        "ha addons",
+        "ha supervisor",
+        "ha core",
+        "ha host",
+        "ha network",
+        "ha os",
+        "ha audio",
+        "ha multicast",
+        "ha dns",
+        "ha jobs",
+        "ha resolution",
+        "ha info",
+        "ha --help"
+    ]
+    
+    # Check if command starts with any allowed command
+    command_safe = False
+    for allowed in allowed_commands:
+        if command.strip().startswith(allowed):
+            command_safe = True
+            break
+    
+    if not command_safe:
+        raise Exception(f"Command not allowed. Allowed commands: {', '.join(allowed_commands)}")
+    
+    try:
+        # Check if running in Home Assistant add-on environment
+        supervisor_token = os.getenv("SUPERVISOR_TOKEN")
+        
+        if supervisor_token:
+            # Use Supervisor API when running as an add-on
+            supervisor_api = SupervisorAPI()
+            return await supervisor_api.execute_ha_cli_equivalent(command)
+        else:
+            # Fallback to shell execution (for development/testing)
+            logger.warning("SUPERVISOR_TOKEN not found, falling back to shell execution")
+            
+            # Execute the command with timeout
+            process = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                limit=1024*1024  # 1MB limit for output
+            )
+            
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), 
+                    timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+                raise Exception(f"Command timed out after {timeout} seconds")
+            
+            return {
+                "command": command,
+                "return_code": process.returncode,
+                "stdout": stdout.decode('utf-8', errors='replace'),
+                "stderr": stderr.decode('utf-8', errors='replace'),
+                "success": process.returncode == 0
+            }
+        
+    except Exception as e:
+        logger.error(f"Error executing HA CLI command '{command}': {e}")
+        raise Exception(f"Failed to execute command: {str(e)}")
+
 async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
     """Handle MCP JSON-RPC requests according to the Azure Functions pattern."""
     
@@ -72,7 +151,7 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                     },
                     "serverInfo": {
                         "name": "ha-mcp-file-server",
-                        "version": "1.1.0"
+                        "version": "1.2.0"
                     }
                 }
             )
@@ -162,6 +241,21 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                     }
                 }
             ]
+            
+            # Add HA CLI tool if enabled
+            if ENABLE_HA_CLI:
+                tools.append({
+                    "name": "execute_ha_cli",
+                    "description": "Execute Home Assistant CLI commands safely (requires MCP_ENABLE_HA_CLI=true)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string", "description": "HA CLI command to execute (e.g., 'ha addons logs core_matter_server')"},
+                            "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30)", "default": 30}
+                        },
+                        "required": ["command"]
+                    }
+                })
             return JsonRpcResponse(
                 id=request.id,
                 result={"tools": tools}
@@ -210,6 +304,16 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                 )
                 result = {"content": [{"type": "text", "text": json.dumps(results, indent=2)}]}
                 
+            elif tool_name == "execute_ha_cli":
+                if not ENABLE_HA_CLI:
+                    raise Exception("HA CLI commands are disabled. Set MCP_ENABLE_HA_CLI=true to enable.")
+                
+                command_result = await execute_ha_cli_command(
+                    arguments["command"],
+                    timeout=arguments.get("timeout", 30)
+                )
+                result = {"content": [{"type": "text", "text": json.dumps(command_result, indent=2)}]}
+                
             else:
                 raise ValueError(f"Unknown tool: {tool_name}")
             
@@ -243,14 +347,15 @@ async def mcp_get_endpoint(code: str = Query(None)):
     
     return {
         "name": "Home Assistant MCP File Server",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "description": "File management server for Home Assistant",
         "protocol": "MCP 2024-11-05",
         "transport": "HTTP",
         "capabilities": ["tools"],
         "status": "healthy",
         "read_only": READ_ONLY,
-        "allowed_dirs": ALLOWED_DIRS
+        "allowed_dirs": ALLOWED_DIRS,
+        "ha_cli_enabled": ENABLE_HA_CLI
     }
 
 # POST endpoint for MCP requests (like Azure Functions pattern)
@@ -302,9 +407,10 @@ async def mcp_post_endpoint(
 async def health_check():
     return {
         "status": "healthy",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "read_only": READ_ONLY,
         "allowed_dirs": ALLOWED_DIRS,
+        "ha_cli_enabled": ENABLE_HA_CLI,
         "mcp_endpoint": "/api/mcp"
     }
 
@@ -323,5 +429,6 @@ if __name__ == "__main__":
     logger.info(f"Read-only mode: {READ_ONLY}")
     logger.info(f"Allowed directories: {ALLOWED_DIRS}")
     logger.info(f"Function key configured: {'Yes' if API_KEY else 'No'}")
+    logger.info(f"HA CLI enabled: {ENABLE_HA_CLI}")
     
     uvicorn.run(app, host="0.0.0.0", port=PORT)

@@ -5,7 +5,7 @@
         "type": "http",
         "url": "http://homeassistant.local:6789/api/mcp"
       },
-      "description": "Home Assistant file management server with AI-powered automation capabilities"
+      "description": "Home Assistant file management server with AI-powered automation capabilities and HA CLI command execution"
     }
   }
 }

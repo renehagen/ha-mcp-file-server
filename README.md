@@ -6,6 +6,7 @@ A simple Model Context Protocol (MCP) server addon for Home Assistant that allow
 
 - **File Operations**: List, read, write, create, and delete files and directories
 - **Search**: Search for text patterns within files
+- **HA CLI Commands**: Execute Home Assistant CLI commands safely (optional)
 - **Security**: API key authentication and path validation
 - **Configurable**: Set allowed directories, read-only mode, and file size limits
 - **Remote Access**: HTTP/SSE transport for remote MCP clients
@@ -27,6 +28,7 @@ Configure the addon through the Home Assistant UI:
 - **allowed_dirs**: List of directories the server can access (default: ["/config", "/share"])
 - **read_only**: Enable read-only mode (default: false)
 - **max_file_size_mb**: Maximum file size in MB (default: 10)
+- **enable_ha_cli**: Enable HA CLI command execution (default: false)
 
 ## Usage
 
@@ -74,6 +76,42 @@ claude mcp add ha-files "http://homeassistant.local:6789/api/mcp?code=YOUR_API_K
 - `create_directory`: Create a new directory
 - `delete_path`: Delete a file or directory
 - `search_files`: Search for files containing specific text
+- `read_file_filtered`: Read file with filtering support for large files
+- `execute_ha_cli`: Execute Home Assistant CLI commands (when enabled)
+
+### Home Assistant CLI Commands
+
+When `enable_ha_cli` is set to `true`, the server provides a secure way to execute Home Assistant CLI commands. This feature includes:
+
+**Safety Features:**
+- Only specific HA CLI commands are allowed (ha addons, ha supervisor, ha core, etc.)
+- Dangerous patterns are blocked (file operations, system commands, shell injection)
+- Commands have a timeout limit (default 30 seconds)
+- Output is limited to 1MB to prevent resource exhaustion
+
+**Allowed Commands:**
+- `ha addons` - Manage add-ons (logs, info, stats, etc.)
+- `ha supervisor` - Supervisor information and operations
+- `ha core` - Home Assistant core operations
+- `ha host` - Host system information
+- `ha network` - Network configuration
+- `ha os` - Operating system operations
+- `ha audio` - Audio system management
+- `ha multicast` - Multicast DNS operations
+- `ha dns` - DNS configuration
+- `ha jobs` - View running jobs
+- `ha resolution` - View system resolution issues
+- `ha info` - General system information
+- `ha --help` - Help information
+
+**Example Usage:**
+```
+execute_ha_cli("ha addons logs core_matter_server")
+execute_ha_cli("ha supervisor info")
+execute_ha_cli("ha core logs")
+```
+
+**Security Note:** HA CLI access is disabled by default. Only enable it if you need command-line access to your Home Assistant system and understand the security implications.
 
 ## 🚀 AI-Powered Use Cases
 
@@ -167,6 +205,7 @@ pip install -r requirements.txt
 export MCP_PORT=6789
 export MCP_API_KEY="test-key"
 export MCP_ALLOWED_DIRS='["/tmp/test"]'
+export MCP_ENABLE_HA_CLI=false  # Set to true to enable HA CLI commands
 python mcp_server.py
 ```
 

@@ -79,6 +79,7 @@ claude mcp add ha-files "http://homeassistant.local:6789/api/mcp?code=YOUR_API_K
 - `read_file_filtered`: Read file with filtering support for large files
 - `execute_ha_cli`: Execute Home Assistant CLI commands (when enabled)
 - `list_ha_entities_devices`: List all Home Assistant entities, devices, and services via REST API (when enabled)
+- `get_ha_entity_registry`: Get all entities from the entity registry with platform and unique_id information (when enabled)
 
 ### Home Assistant CLI Commands
 
@@ -196,6 +197,145 @@ list_ha_entities_devices(limit=0, include_entities=true, include_devices=true)
 - **Real-time Data**: Get current states and attributes for all entities
 - **Device Information**: Access device registry data including manufacturers, models, and relationships
 - **Service Discovery**: Understand what actions are available in your system
+
+**Security Note:** HA CLI access (including entity/device listing) is disabled by default. Only enable it if you need programmatic access to your Home Assistant system and understand the security implications.
+
+### Entity Registry Access
+
+When `enable_ha_cli` is set to `true`, the server provides efficient access to the Home Assistant entity registry through the `get_ha_entity_registry` tool.
+
+**`get_ha_entity_registry` Tool:**
+This is the **most efficient way** to retrieve all entities from Home Assistant. It provides complete registry information including:
+
+- **Platform Information**: Know which integration created each entity (mqtt, zwave, zigbee, esphome, etc.)
+- **Unique IDs**: Access the unique_id field that can be matched with device topics (especially useful for MQTT)
+- **Original Names**: Get the original entity names before customization
+- **Registry Metadata**: Access all entity registry data in a single API call
+
+**Key Advantages Over `list_ha_entities_devices`:**
+- ✅ **Single API Call**: Retrieves all 700+ entities at once via WebSocket API
+- ✅ **Platform Filtering**: Built-in filtering by platform (mqtt, zwave, etc.)
+- ✅ **Unique ID Access**: Essential for matching entities to device topics
+- ✅ **Registry-Only Data**: Includes information not available in entity states
+- ✅ **Pagination Support**: Control response size with limit and offset parameters
+
+**Parameters (all optional):**
+- `limit` (integer, default: 100): Maximum number of entities to return (set to 0 for count only)
+- `offset` (integer, default: 0): Number of entities to skip for pagination
+- `platform_filter` (string): Filter entities by platform (e.g., 'mqtt', 'zwave', 'zigbee', 'esphome')
+- `entity_filter` (string): Search pattern to filter entity IDs (case-insensitive)
+- `fields` (array): List of field names to return. If not specified, returns all fields. **Use this to dramatically reduce token usage!**
+  - Common fields: `entity_id`, `unique_id`, `platform`, `original_name`, `device_id`, `area_id`, `disabled_by`
+  - **Token savings**: Using `["entity_id", "unique_id"]` reduces tokens by ~95% (from ~19k to ~1k per 30 entities)
+
+**Example Usage:**
+```
+# Get first 100 MQTT entities (default limit)
+get_ha_entity_registry(platform_filter="mqtt")
+
+# Get next 100 MQTT entities
+get_ha_entity_registry(platform_filter="mqtt", offset=100)
+
+# Get all motion sensor entities, 50 at a time
+get_ha_entity_registry(entity_filter="motion", limit=50)
+
+# Get count of all entities without returning data
+get_ha_entity_registry(limit=0)
+
+# COMPACT MODE: Get only entity_id and unique_id (95% token reduction!)
+get_ha_entity_registry(
+    platform_filter="mqtt",
+    limit=100,
+    fields=["entity_id", "unique_id"]
+)
+
+# Get essential fields for MQTT analysis
+get_ha_entity_registry(
+    platform_filter="mqtt",
+    limit=100,
+    fields=["entity_id", "unique_id", "platform", "original_name"]
+)
+
+# Get all Zigbee entities containing "bedroom", first 25, compact
+get_ha_entity_registry(
+    platform_filter="zigbee",
+    entity_filter="bedroom",
+    limit=25,
+    fields=["entity_id", "unique_id", "platform"]
+)
+```
+
+**Example Response:**
+```json
+{
+  "entities": [
+    {
+      "entity_id": "sensor.beweging_gang_beweging",
+      "platform": "mqtt",
+      "unique_id": "homey-5d7a3bdaf7af713c2c45cea6_beweging-gang_alarm-motion",
+      "original_name": "Beweging Gang - Beweging",
+      "device_id": "abc123",
+      "config_entry_id": "xyz789",
+      "disabled_by": null,
+      "hidden_by": null
+    }
+  ],
+  "pagination": {
+    "returned_count": 1,
+    "filtered_count": 150,
+    "total_count": 727,
+    "offset": 0,
+    "limit": 100
+  },
+  "timestamp": "now",
+  "filters_applied": {
+    "platform": "mqtt",
+    "entity_pattern": "beweging",
+    "fields": "all"
+  }
+}
+```
+
+**Compact Response Example (with fields parameter):**
+```json
+{
+  "entities": [
+    {
+      "entity_id": "sensor.beweging_gang_beweging",
+      "unique_id": "homey-5d7a3bdaf7af713c2c45cea6_beweging-gang_alarm-motion"
+    },
+    {
+      "entity_id": "sensor.beweging_keuken_beweging",
+      "unique_id": "homey-5d7a3bdaf7af713c2c45cea6_beweging-keuken_alarm-motion"
+    }
+  ],
+  "pagination": {
+    "returned_count": 2,
+    "filtered_count": 725,
+    "total_count": 727,
+    "offset": 0,
+    "limit": 100
+  },
+  "filters_applied": {
+    "platform": "mqtt",
+    "fields": ["entity_id", "unique_id"]
+  }
+}
+```
+
+**Token Usage Comparison:**
+- **Full response** (all fields): ~19,000 tokens per 30 entities
+- **Compact response** (2 fields): ~1,000 tokens per 100 entities (95% reduction!)
+- To get all 725 MQTT entities:
+  - Full: 25 batches × 19k = 475k tokens ❌ (exceeds limits)
+  - Compact: 8 batches × 1k = 8k tokens ✅ (well within limits)
+
+**Use Cases:**
+- 🔍 **MQTT Entity Discovery**: Find all MQTT entities and their unique_ids for topic matching
+- 🏠 **Platform Auditing**: Identify which entities belong to which integrations
+- 🔧 **Entity Management**: Clean up entities by platform or naming patterns
+- 📊 **System Analysis**: Get complete overview of all registered entities in one call
+- 🔄 **Migration Planning**: Identify entities before migrating between platforms
 
 **Security Note:** HA CLI access (including entity/device listing) is disabled by default. Only enable it if you need programmatic access to your Home Assistant system and understand the security implications.
 

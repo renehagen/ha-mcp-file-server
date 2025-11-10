@@ -401,6 +401,39 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                             },
                             "required": []
                         }
+                    },
+                    {
+                        "name": "get_ha_entity_registry",
+                        "description": "Get entities from Home Assistant entity registry with pagination (requires MCP_ENABLE_HA_CLI=true). This is the most efficient way to get entities with platform information (mqtt, zwave, etc.), unique_id, and registry metadata. Use limit parameter to control response size. Default limit is 100 entities. Use fields parameter to reduce token usage by returning only specific fields.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "limit": {
+                                    "type": "integer",
+                                    "description": "Maximum number of entities to return (default: 100, set to 0 for count only)",
+                                    "default": 100
+                                },
+                                "offset": {
+                                    "type": "integer",
+                                    "description": "Number of entities to skip for pagination (default: 0)",
+                                    "default": 0
+                                },
+                                "platform_filter": {
+                                    "type": "string",
+                                    "description": "Filter entities by platform (e.g., 'mqtt', 'zwave', 'zigbee', 'esphome')"
+                                },
+                                "entity_filter": {
+                                    "type": "string",
+                                    "description": "Search pattern to filter entity IDs (case-insensitive substring match)"
+                                },
+                                "fields": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "List of field names to return. If not specified, returns all fields. Common fields: 'entity_id', 'unique_id', 'platform', 'original_name', 'device_id'. Use this to reduce token usage (e.g., ['entity_id', 'unique_id'] reduces tokens by ~95%)."
+                                }
+                            },
+                            "required": []
+                        }
                     }
                 ])
             return JsonRpcResponse(
@@ -475,6 +508,70 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                     include_services=arguments.get("include_services", False)
                 )
                 result = {"content": [{"type": "text", "text": json.dumps(ha_data, indent=2)}]}
+            
+            elif tool_name == "get_ha_entity_registry":
+                if not ENABLE_HA_CLI:
+                    raise Exception("HA CLI commands are disabled. Set MCP_ENABLE_HA_CLI=true to enable.")
+                
+                supervisor_api = SupervisorAPI()
+                registry_data = await supervisor_api.get_ha_entity_registry()
+                
+                # Apply filters if provided
+                all_entities = registry_data.get("entities", [])
+                total_count = len(all_entities)
+                
+                # Filter by platform
+                platform_filter = arguments.get("platform_filter")
+                if platform_filter:
+                    all_entities = [e for e in all_entities if e.get("platform", "").lower() == platform_filter.lower()]
+                
+                # Filter by entity_id pattern
+                entity_filter = arguments.get("entity_filter")
+                if entity_filter:
+                    all_entities = [e for e in all_entities if entity_filter.lower() in e.get("entity_id", "").lower()]
+                
+                # Get pagination parameters
+                limit = arguments.get("limit", 100)
+                offset = arguments.get("offset", 0)
+                
+                # Apply pagination
+                filtered_count = len(all_entities)
+                start_idx = offset
+                end_idx = offset + limit if limit > 0 else len(all_entities)
+                paginated_entities = all_entities[start_idx:end_idx]
+                
+                # Apply field filtering if specified
+                fields = arguments.get("fields")
+                if fields and isinstance(fields, list):
+                    paginated_entities = [
+                        {key: entity.get(key) for key in fields if key in entity}
+                        for entity in paginated_entities
+                    ]
+                
+                # Prepare response with filtered and paginated data
+                filtered_result = {
+                    "entities": paginated_entities,
+                    "pagination": {
+                        "returned_count": len(paginated_entities),
+                        "filtered_count": filtered_count,
+                        "total_count": total_count,
+                        "offset": offset,
+                        "limit": limit
+                    },
+                    "timestamp": registry_data.get("timestamp"),
+                    "filters_applied": {
+                        "platform": platform_filter,
+                        "entity_pattern": entity_filter,
+                        "fields": fields if fields else "all"
+                    }
+                }
+                
+                # Include fallback info if present
+                if registry_data.get("fallback_mode"):
+                    filtered_result["fallback_mode"] = True
+                    filtered_result["note"] = registry_data.get("note")
+                
+                result = {"content": [{"type": "text", "text": json.dumps(filtered_result, indent=2)}]}
                 
             else:
                 raise ValueError(f"Unknown tool: {tool_name}")

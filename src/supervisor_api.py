@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import aiohttp
+import asyncio
 from typing import Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -164,6 +165,105 @@ class SupervisorAPI:
             logger.error(f"Error getting HA devices: {e}")
             # Fallback: try alternative approach or return partial info
             raise Exception(f"Failed to get devices: {str(e)}")
+    
+    async def get_ha_entity_registry(self) -> Dict[str, Any]:
+        """Get all Home Assistant entities from entity registry.
+        
+        This is the most efficient way to get all entities with platform information,
+        unique_id, and other registry metadata. Particularly useful for filtering
+        entities by platform (e.g., mqtt, zwave, zigbee).
+        
+        Uses WebSocket API to access the entity registry.
+        
+        Returns:
+            Dict containing:
+            - entities: List of entity registry entries with entity_id, platform, unique_id, etc.
+            - count: Number of entities
+            - timestamp: Current timestamp
+        """
+        try:
+            # Entity registry is only accessible via WebSocket API
+            # We'll use the supervisor proxy to connect to the websocket
+            ws_url = f"ws://supervisor/core/websocket"
+            
+            logger.info(f"Connecting to HA WebSocket: {ws_url}")
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(ws_url, headers=self._get_headers()) as ws:
+                    # Wait for auth_required message
+                    msg = await ws.receive_json()
+                    logger.debug(f"Received: {msg}")
+                    
+                    if msg.get("type") != "auth_required":
+                        raise Exception(f"Expected auth_required, got: {msg}")
+                    
+                    # Send auth message with supervisor token
+                    await ws.send_json({
+                        "type": "auth",
+                        "access_token": self.token
+                    })
+                    
+                    # Wait for auth_ok
+                    auth_response = await ws.receive_json()
+                    logger.debug(f"Auth response: {auth_response}")
+                    
+                    if auth_response.get("type") != "auth_ok":
+                        raise Exception(f"Authentication failed: {auth_response}")
+                    
+                    # Request entity registry list
+                    request_id = 1
+                    await ws.send_json({
+                        "id": request_id,
+                        "type": "config/entity_registry/list"
+                    })
+                    
+                    # Wait for response
+                    response = await ws.receive_json()
+                    logger.debug(f"Entity registry response received")
+                    
+                    if not response.get("success"):
+                        raise Exception(f"Failed to get entity registry: {response}")
+                    
+                    entities = response.get("result", [])
+                    
+                    await ws.close()
+                    
+                    return {
+                        "entities": entities,
+                        "count": len(entities),
+                        "timestamp": "now"
+                    }
+                    
+        except Exception as e:
+            logger.error(f"Error getting HA entity registry via WebSocket: {e}")
+            logger.info("Falling back to states endpoint with enhanced information")
+            
+            try:
+                # Fallback: get entities via states endpoint
+                states = await self.get_ha_entities()
+                
+                # Convert states to registry-like format
+                entities_from_states = []
+                for entity in states.get("entities", []):
+                    entities_from_states.append({
+                        "entity_id": entity.get("entity_id"),
+                        "state": entity.get("state"),
+                        "attributes": entity.get("attributes", {}),
+                        "last_changed": entity.get("last_changed"),
+                        "platform": entity.get("attributes", {}).get("device_class", "unknown"),
+                        "note": "Limited data - using states endpoint fallback"
+                    })
+                
+                return {
+                    "entities": entities_from_states,
+                    "count": len(entities_from_states),
+                    "timestamp": "now",
+                    "fallback_mode": True,
+                    "note": "Entity registry accessed via states endpoint (limited data)"
+                }
+            except Exception as fallback_error:
+                logger.error(f"Fallback also failed: {fallback_error}")
+                raise Exception(f"Failed to get entity registry: {str(e)}")
     
     async def get_ha_services(self) -> Dict[str, Any]:
         """Get all Home Assistant services."""

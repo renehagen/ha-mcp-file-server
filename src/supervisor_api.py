@@ -111,6 +111,84 @@ class SupervisorAPI:
                 
                 return await response.text()
     
+    async def call_ha_api(self, method: str, endpoint: str, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Make a direct call to Home Assistant API via Supervisor proxy."""
+        url = f"{self.base_url}/core/api{endpoint}"
+        
+        logger.info(f"Calling HA API: {method} {url}")
+        
+        async with aiohttp.ClientSession() as session:
+            if method.upper() == "GET":
+                async with session.get(url, headers=self._get_headers()) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"Failed to call HA API: {response.status} - {error_text}")
+                        raise Exception(f"Failed to call HA API: {response.status} - {error_text}")
+                    
+                    return await response.json()
+            elif method.upper() == "POST":
+                async with session.post(url, headers=self._get_headers(), json=data) as response:
+                    if response.status not in [200, 201]:
+                        error_text = await response.text()
+                        logger.error(f"Failed to call HA API: {response.status} - {error_text}")
+                        raise Exception(f"Failed to call HA API: {response.status} - {error_text}")
+                    
+                    return await response.json()
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+    
+    async def get_ha_entities(self) -> Dict[str, Any]:
+        """Get all Home Assistant entities (states)."""
+        try:
+            entities = await self.call_ha_api("GET", "/states")
+            return {
+                "entities": entities,
+                "count": len(entities) if entities else 0,
+                "timestamp": "now"
+            }
+        except Exception as e:
+            logger.error(f"Error getting HA entities: {e}")
+            raise Exception(f"Failed to get entities: {str(e)}")
+    
+    async def get_ha_devices(self) -> Dict[str, Any]:
+        """Get all Home Assistant devices from device registry."""
+        try:
+            # Note: This endpoint might require admin privileges
+            devices = await self.call_ha_api("GET", "/config/device_registry/list")
+            return {
+                "devices": devices,
+                "count": len(devices) if devices else 0,
+                "timestamp": "now"
+            }
+        except Exception as e:
+            logger.error(f"Error getting HA devices: {e}")
+            # Fallback: try alternative approach or return partial info
+            raise Exception(f"Failed to get devices: {str(e)}")
+    
+    async def get_ha_services(self) -> Dict[str, Any]:
+        """Get all Home Assistant services."""
+        try:
+            services = await self.call_ha_api("GET", "/services")
+            return {
+                "services": services,
+                "timestamp": "now"
+            }
+        except Exception as e:
+            logger.error(f"Error getting HA services: {e}")
+            raise Exception(f"Failed to get services: {str(e)}")
+    
+    async def get_ha_config(self) -> Dict[str, Any]:
+        """Get Home Assistant configuration info."""
+        try:
+            config = await self.call_ha_api("GET", "/config")
+            return {
+                "config": config,
+                "timestamp": "now"
+            }
+        except Exception as e:
+            logger.error(f"Error getting HA config: {e}")
+            raise Exception(f"Failed to get config: {str(e)}")
+    
     async def execute_ha_cli_equivalent(self, command: str) -> Dict[str, Any]:
         """Execute equivalent of HA CLI commands using Supervisor API."""
         

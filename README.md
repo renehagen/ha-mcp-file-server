@@ -78,6 +78,7 @@ claude mcp add ha-files "http://homeassistant.local:6789/api/mcp?code=YOUR_API_K
 - `search_files`: Search for files containing specific text
 - `read_file_filtered`: Read file with filtering support for large files
 - `execute_ha_cli`: Execute Home Assistant CLI commands (when enabled)
+- `list_ha_entities_devices`: List all Home Assistant entities, devices, and services via REST API (when enabled)
 
 ### Home Assistant CLI Commands
 
@@ -111,29 +112,116 @@ execute_ha_cli("ha supervisor info")
 execute_ha_cli("ha core logs")
 ```
 
-**Security Note:** HA CLI access is disabled by default. Only enable it if you need command-line access to your Home Assistant system and understand the security implications.
+### Home Assistant Entity & Device Management
+
+When `enable_ha_cli` is set to `true`, the server also provides direct access to Home Assistant's REST API for comprehensive entity and device management:
+
+**`list_ha_entities_devices` Tool:**
+This tool provides complete visibility into your Home Assistant setup by retrieving:
+
+- **All Entities**: Every sensor, light, switch, climate device, etc. with their current states
+- **All Devices**: Physical and logical devices registered in Home Assistant
+- **All Services**: Available services you can call (like `light.turn_on`, `climate.set_temperature`)
+- **Summary Statistics**: Quick overview with counts and totals
+
+**Parameters (all optional):**
+- `limit` (integer, default: 50): Maximum number of items to return per request
+- `offset` (integer, default: 0): Number of items to skip for pagination
+- `domain_filter` (string): Filter entities by domain (e.g., 'light', 'sensor', 'switch', 'climate')
+- `entity_filter` (string): Search pattern to filter entity IDs (case-insensitive)
+- `include_entities` (boolean, default: true): Include entities in response
+- `include_devices` (boolean, default: true): Include devices in response
+- `include_services` (boolean, default: false): Include services in response
+
+**Example Usage:**
+```
+# Get first 10 devices
+list_ha_entities_devices(limit=10, include_entities=false)
+
+# Get all lights
+list_ha_entities_devices(domain_filter="light", limit=100)
+
+# Search for bedroom entities
+list_ha_entities_devices(entity_filter="bedroom", limit=20)
+
+# Get next page of results
+list_ha_entities_devices(limit=50, offset=50)
+
+# Get only summary (no full data)
+list_ha_entities_devices(limit=0, include_entities=true, include_devices=true)
+```
+
+**Example Response:**
+```json
+{
+  "entities": {
+    "items": [
+      {
+        "entity_id": "light.living_room",
+        "state": "on",
+        "attributes": {"brightness": 255, "color_temp": 370},
+        "last_changed": "2025-11-09T10:30:00"
+      }
+    ],
+    "total_count": 150,
+    "returned_count": 10,
+    "offset": 0,
+    "limit": 10
+  },
+  "devices": {
+    "items": [
+      {
+        "id": "abc123",
+        "name": "Living Room Light",
+        "manufacturer": "Philips",
+        "model": "Hue Bulb"
+      }
+    ],
+    "total_count": 45,
+    "returned_count": 10,
+    "offset": 0,
+    "limit": 10
+  },
+  "summary": {
+    "entity_count": 150,
+    "device_count": 45
+  }
+}
+```
+
+**Key Benefits:**
+- **Pagination Support**: Handle large systems with thousands of entities efficiently
+- **Domain Filtering**: Focus on specific entity types (lights, sensors, etc.)
+- **Search Capability**: Find entities by name pattern
+- **Real-time Data**: Get current states and attributes for all entities
+- **Device Information**: Access device registry data including manufacturers, models, and relationships
+- **Service Discovery**: Understand what actions are available in your system
+
+**Security Note:** HA CLI access (including entity/device listing) is disabled by default. Only enable it if you need programmatic access to your Home Assistant system and understand the security implications.
 
 ## 🚀 AI-Powered Use Cases
 
 This MCP server unlocks powerful AI-driven Home Assistant management capabilities. Here are the top 5 use cases:
 
 ### 1. 🔍 **Smart Entity Management & Dependency Tracking**
-AI can analyze your entire Home Assistant configuration to provide intelligent entity management:
+AI can analyze your entire Home Assistant configuration AND live system state to provide intelligent entity management:
 
 **Example scenarios:**
 - *"Find all places where `sensor.living_room_temperature` is referenced"* - AI searches all YAML files, automations, dashboards, and scripts
 - *"I want to rename `light.bedroom` to `light.master_bedroom` - show me what will break"* - AI identifies dependencies before you make changes
-- *"Clean up my configuration - find orphaned entities that are defined but never used"* - AI detects unused sensors, switches, and automations
-- *"Map dependencies for my lighting system"* - AI creates a visual dependency graph showing which automations control which lights
+- *"Clean up my configuration - find orphaned entities that are defined but never used"* - AI compares live entities with configuration files to detect unused sensors, switches, and automations
+- *"Show me all my Philips Hue devices and their current states"* - AI uses the entity/device listing to provide real-time device inventory
+- *"Map dependencies for my lighting system"* - AI creates a visual dependency graph showing which automations control which lights, including current states
 
 ### 2. 🩺 **Automated Troubleshooting & Diagnostics**
-When things break, AI becomes your personal Home Assistant expert:
+When things break, AI becomes your personal Home Assistant expert with access to both configuration and live system state:
 
 **Example scenarios:**
-- *"My bedroom lights automation stopped working yesterday"* - AI searches logs, checks recent config changes, identifies the automation file, and pinpoints the exact issue
-- *"Why is my Z-Wave network unstable?"* - AI analyzes Z-Wave logs, device configurations, and network topology to identify interference or failing devices
-- *"Zigbee devices keep going unavailable"* - AI correlates device logs with network events and suggests specific fixes
-- *"My climate control is acting weird"* - AI traces climate entity through all automations, templates, and scripts to find the root cause
+- *"My bedroom lights automation stopped working yesterday"* - AI searches logs, checks recent config changes, examines current entity states, and pinpoints the exact issue
+- *"Why is my Z-Wave network unstable?"* - AI analyzes Z-Wave logs, device configurations, current device states, and network topology to identify interference or failing devices
+- *"Zigbee devices keep going unavailable"* - AI correlates device logs with live device registry data and suggests specific fixes
+- *"My climate control is acting weird"* - AI traces climate entity through all automations, templates, and scripts while checking current sensor readings and device states
+- *"Which of my 150 entities are currently unavailable?"* - AI instantly scans all live entity states to identify offline devices
 
 ### 3. 🔒 **Configuration Auditing & Security Analysis**
 AI performs comprehensive security and best practices review:

@@ -62,6 +62,108 @@ def verify_function_key(code: str):
         raise HTTPException(status_code=401, detail="Invalid function key")
     return True
 
+async def get_ha_entities_and_devices(
+    limit: Optional[int] = None,
+    offset: int = 0,
+    entity_filter: Optional[str] = None,
+    domain_filter: Optional[str] = None,
+    include_entities: bool = True,
+    include_devices: bool = True,
+    include_services: bool = False
+) -> Dict[str, Any]:
+    """Get entities and devices from Home Assistant via REST API with filtering and pagination."""
+    
+    if not ENABLE_HA_CLI:
+        raise Exception("HA CLI commands are disabled")
+    
+    supervisor_token = os.getenv("SUPERVISOR_TOKEN")
+    if not supervisor_token:
+        raise Exception("SUPERVISOR_TOKEN not available")
+    
+    supervisor_api = SupervisorAPI()
+    
+    try:
+        result = {
+            "summary": {},
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # Get entities if requested
+        if include_entities:
+            entities_data = await supervisor_api.get_ha_entities()
+            all_entities = entities_data.get("entities", [])
+            
+            # Apply domain filter
+            if domain_filter:
+                all_entities = [e for e in all_entities if e.get("entity_id", "").startswith(f"{domain_filter}.")]
+            
+            # Apply entity_id filter (search pattern)
+            if entity_filter:
+                all_entities = [e for e in all_entities if entity_filter.lower() in e.get("entity_id", "").lower()]
+            
+            # Apply pagination
+            total_entities = len(all_entities)
+            start_idx = offset
+            end_idx = offset + limit if limit else len(all_entities)
+            paginated_entities = all_entities[start_idx:end_idx]
+            
+            result["entities"] = {
+                "items": paginated_entities,
+                "total_count": total_entities,
+                "returned_count": len(paginated_entities),
+                "offset": offset,
+                "limit": limit
+            }
+            result["summary"]["entity_count"] = total_entities
+        
+        # Get devices if requested
+        if include_devices:
+            try:
+                devices_data = await supervisor_api.get_ha_devices()
+                all_devices = devices_data.get("devices", [])
+                
+                # Apply pagination
+                total_devices = len(all_devices)
+                start_idx = offset
+                end_idx = offset + limit if limit else len(all_devices)
+                paginated_devices = all_devices[start_idx:end_idx]
+                
+                result["devices"] = {
+                    "items": paginated_devices,
+                    "total_count": total_devices,
+                    "returned_count": len(paginated_devices),
+                    "offset": offset,
+                    "limit": limit
+                }
+                result["summary"]["device_count"] = total_devices
+            except Exception as device_error:
+                logger.warning(f"Could not get devices: {device_error}")
+                result["devices"] = {
+                    "items": [],
+                    "total_count": 0,
+                    "error": "Device registry access may require additional permissions"
+                }
+                result["summary"]["device_count"] = 0
+        
+        # Get services if requested
+        if include_services:
+            try:
+                services_data = await supervisor_api.get_ha_services()
+                result["services"] = services_data
+                result["summary"]["service_domains"] = len(services_data.get("services", {}))
+            except Exception as service_error:
+                logger.warning(f"Could not get services: {service_error}")
+                result["services"] = {
+                    "services": {},
+                    "error": str(service_error)
+                }
+        
+        return result
+        
+    except Exception as e:
+        logger.error(f"Error getting HA entities/devices: {e}")
+        raise Exception(f"Failed to get entities/devices: {str(e)}")
+
 async def execute_ha_cli_command(command: str, timeout: int = 30) -> Dict[str, Any]:
     """Execute HA CLI command using Supervisor API."""
     
@@ -242,20 +344,65 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                 }
             ]
             
-            # Add HA CLI tool if enabled
+            # Add HA CLI tools if enabled
             if ENABLE_HA_CLI:
-                tools.append({
-                    "name": "execute_ha_cli",
-                    "description": "Execute Home Assistant CLI commands safely (requires MCP_ENABLE_HA_CLI=true)",
-                    "inputSchema": {
-                        "type": "object",
-                        "properties": {
-                            "command": {"type": "string", "description": "HA CLI command to execute (e.g., 'ha addons logs core_matter_server')"},
-                            "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30)", "default": 30}
-                        },
-                        "required": ["command"]
+                tools.extend([
+                    {
+                        "name": "execute_ha_cli",
+                        "description": "Execute Home Assistant CLI commands safely (requires MCP_ENABLE_HA_CLI=true)",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "command": {"type": "string", "description": "HA CLI command to execute (e.g., 'ha addons logs core_matter_server')"},
+                                "timeout": {"type": "integer", "description": "Timeout in seconds (default: 30)", "default": 30}
+                            },
+                            "required": ["command"]
+                        }
+                    },
+                    {
+                        "name": "list_ha_entities_devices",
+                        "description": "List Home Assistant entities, devices, and services via REST API with pagination and filtering (requires MCP_ENABLE_HA_CLI=true). Use limit parameter to control response size.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "limit": {
+                                    "type": "integer",
+                                    "description": "Maximum number of items to return (default: 50, recommended: 10-100 for large systems)",
+                                    "default": 50
+                                },
+                                "offset": {
+                                    "type": "integer",
+                                    "description": "Number of items to skip for pagination (default: 0)",
+                                    "default": 0
+                                },
+                                "domain_filter": {
+                                    "type": "string",
+                                    "description": "Filter entities by domain (e.g., 'light', 'sensor', 'switch', 'climate')"
+                                },
+                                "entity_filter": {
+                                    "type": "string",
+                                    "description": "Search pattern to filter entity IDs (case-insensitive substring match)"
+                                },
+                                "include_entities": {
+                                    "type": "boolean",
+                                    "description": "Include entities in response (default: true)",
+                                    "default": True
+                                },
+                                "include_devices": {
+                                    "type": "boolean",
+                                    "description": "Include devices in response (default: true)",
+                                    "default": True
+                                },
+                                "include_services": {
+                                    "type": "boolean",
+                                    "description": "Include services in response (default: false)",
+                                    "default": False
+                                }
+                            },
+                            "required": []
+                        }
                     }
-                })
+                ])
             return JsonRpcResponse(
                 id=request.id,
                 result={"tools": tools}
@@ -313,6 +460,21 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                     timeout=arguments.get("timeout", 30)
                 )
                 result = {"content": [{"type": "text", "text": json.dumps(command_result, indent=2)}]}
+                
+            elif tool_name == "list_ha_entities_devices":
+                if not ENABLE_HA_CLI:
+                    raise Exception("HA CLI commands are disabled. Set MCP_ENABLE_HA_CLI=true to enable.")
+                
+                ha_data = await get_ha_entities_and_devices(
+                    limit=arguments.get("limit", 50),
+                    offset=arguments.get("offset", 0),
+                    entity_filter=arguments.get("entity_filter"),
+                    domain_filter=arguments.get("domain_filter"),
+                    include_entities=arguments.get("include_entities", True),
+                    include_devices=arguments.get("include_devices", True),
+                    include_services=arguments.get("include_services", False)
+                )
+                result = {"content": [{"type": "text", "text": json.dumps(ha_data, indent=2)}]}
                 
             else:
                 raise ValueError(f"Unknown tool: {tool_name}")

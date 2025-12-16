@@ -97,9 +97,13 @@ async def get_ha_entities_and_devices(
             if domain_filter:
                 all_entities = [e for e in all_entities if e.get("entity_id", "").startswith(f"{domain_filter}.")]
             
-            # Apply entity_id filter (search pattern)
+            # Apply entity_id filter (search pattern on entity_id and friendly_name)
             if entity_filter:
-                all_entities = [e for e in all_entities if entity_filter.lower() in e.get("entity_id", "").lower()]
+                all_entities = [
+                    e for e in all_entities 
+                    if entity_filter.lower() in e.get("entity_id", "").lower() or 
+                       entity_filter.lower() in e.get("attributes", {}).get("friendly_name", "").lower()
+                ]
             
             # Apply pagination
             total_entities = len(all_entities)
@@ -381,7 +385,7 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                                 },
                                 "entity_filter": {
                                     "type": "string",
-                                    "description": "Search pattern to filter entity IDs (case-insensitive substring match)"
+                                    "description": "Search pattern to filter entity IDs and friendly names (case-insensitive substring match)"
                                 },
                                 "include_entities": {
                                     "type": "boolean",

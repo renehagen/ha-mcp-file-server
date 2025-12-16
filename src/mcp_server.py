@@ -8,6 +8,8 @@ from fastapi import FastAPI, HTTPException, Request, Query
 from pydantic import BaseModel
 import uvicorn
 from datetime import datetime
+import paho.mqtt.client as mqtt
+import time
 
 from file_handler import FileHandler
 from supervisor_api import SupervisorAPI
@@ -22,6 +24,10 @@ API_KEY = os.getenv("MCP_API_KEY", "")
 READ_ONLY = os.getenv("MCP_READ_ONLY", "false").lower() == "true"
 MAX_FILE_SIZE_MB = int(os.getenv("MCP_MAX_FILE_SIZE_MB", "10"))
 ENABLE_HA_CLI = os.getenv("MCP_ENABLE_HA_CLI", "false").lower() == "true"
+MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.1.78")
+MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
+MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 
 # Parse allowed directories - bashio provides them as newline-separated values
 allowed_dirs_env = os.getenv("MCP_ALLOWED_DIRS", "")
@@ -167,6 +173,111 @@ async def get_ha_entities_and_devices(
     except Exception as e:
         logger.error(f"Error getting HA entities/devices: {e}")
         raise Exception(f"Failed to get entities/devices: {str(e)}")
+
+async def mqtt_publish(topic: str, payload: str, broker: str = None, port: int = None, 
+                      username: str = None, password: str = None, qos: int = 0, 
+                      retain: bool = False) -> Dict[str, Any]:
+    """Publish a message to an MQTT topic."""
+    broker = broker or MQTT_BROKER
+    port = port or MQTT_PORT
+    username = username or MQTT_USERNAME
+    password = password or MQTT_PASSWORD
+    
+    try:
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        
+        if username:
+            client.username_pw_set(username, password)
+        
+        # Connect to broker
+        client.connect(broker, port, 60)
+        
+        # Publish message
+        result = client.publish(topic, payload, qos=qos, retain=retain)
+        
+        # Wait for publish to complete
+        result.wait_for_publish(timeout=5)
+        
+        client.disconnect()
+        
+        return {
+            "success": True,
+            "broker": broker,
+            "port": port,
+            "topic": topic,
+            "payload": payload,
+            "qos": qos,
+            "retain": retain,
+            "message": "Message published successfully"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error publishing to MQTT topic '{topic}': {e}")
+        raise Exception(f"Failed to publish MQTT message: {str(e)}")
+
+
+async def mqtt_subscribe(topic: str, broker: str = None, port: int = None,
+                        username: str = None, password: str = None, 
+                        timeout: int = 10, max_messages: int = 10) -> Dict[str, Any]:
+    """Subscribe to an MQTT topic and collect messages."""
+    broker = broker or MQTT_BROKER
+    port = port or MQTT_PORT
+    username = username or MQTT_USERNAME
+    password = password or MQTT_PASSWORD
+    
+    messages = []
+    
+    def on_connect(client, userdata, flags, reason_code, properties):
+        client.subscribe(topic)
+        logger.info(f"Subscribed to topic: {topic}")
+    
+    def on_message(client, userdata, msg):
+        messages.append({
+            "topic": msg.topic,
+            "payload": msg.payload.decode('utf-8', errors='replace'),
+            "qos": msg.qos,
+            "retain": msg.retain,
+            "timestamp": datetime.now().isoformat()
+        })
+        if len(messages) >= max_messages:
+            client.disconnect()
+    
+    try:
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        client.on_connect = on_connect
+        client.on_message = on_message
+        
+        if username:
+            client.username_pw_set(username, password)
+        
+        # Connect to broker
+        client.connect(broker, port, 60)
+        
+        # Start loop in background
+        client.loop_start()
+        
+        # Wait for messages or timeout
+        start_time = time.time()
+        while time.time() - start_time < timeout and len(messages) < max_messages:
+            await asyncio.sleep(0.1)
+        
+        client.loop_stop()
+        client.disconnect()
+        
+        return {
+            "success": True,
+            "broker": broker,
+            "port": port,
+            "topic": topic,
+            "messages_received": len(messages),
+            "messages": messages,
+            "timeout_reached": time.time() - start_time >= timeout
+        }
+        
+    except Exception as e:
+        logger.error(f"Error subscribing to MQTT topic '{topic}': {e}")
+        raise Exception(f"Failed to subscribe to MQTT topic: {str(e)}")
+
 
 async def execute_ha_cli_command(command: str, timeout: int = 30) -> Dict[str, Any]:
     """Execute HA CLI command using Supervisor API."""
@@ -440,6 +551,46 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                         }
                     }
                 ])
+            
+            # Add MQTT tools
+            tools.extend([
+                {
+                    "name": "mqtt_publish",
+                    "description": "Publish a message to an MQTT topic. Default broker: 192.168.1.78, no authentication required by default.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "topic": {"type": "string", "description": "MQTT topic to publish to (e.g., 'home/livingroom/light')"},
+                            "payload": {"type": "string", "description": "Message payload to publish"},
+                            "broker": {"type": "string", "description": "MQTT broker IP address (default: 192.168.1.78)"},
+                            "port": {"type": "integer", "description": "MQTT broker port (default: 1883)"},
+                            "username": {"type": "string", "description": "MQTT username (optional)"},
+                            "password": {"type": "string", "description": "MQTT password (optional)"},
+                            "qos": {"type": "integer", "description": "Quality of Service level (0, 1, or 2, default: 0)", "default": 0},
+                            "retain": {"type": "boolean", "description": "Retain message flag (default: false)", "default": False}
+                        },
+                        "required": ["topic", "payload"]
+                    }
+                },
+                {
+                    "name": "mqtt_subscribe",
+                    "description": "Subscribe to an MQTT topic and collect messages. Default broker: 192.168.1.78, no authentication required by default.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "topic": {"type": "string", "description": "MQTT topic to subscribe to (supports wildcards like 'home/#' or 'home/+/temperature')"},
+                            "broker": {"type": "string", "description": "MQTT broker IP address (default: 192.168.1.78)"},
+                            "port": {"type": "integer", "description": "MQTT broker port (default: 1883)"},
+                            "username": {"type": "string", "description": "MQTT username (optional)"},
+                            "password": {"type": "string", "description": "MQTT password (optional)"},
+                            "timeout": {"type": "integer", "description": "Maximum time to wait for messages in seconds (default: 10)", "default": 10},
+                            "max_messages": {"type": "integer", "description": "Maximum number of messages to collect (default: 10)", "default": 10}
+                        },
+                        "required": ["topic"]
+                    }
+                }
+            ])
+            
             return JsonRpcResponse(
                 id=request.id,
                 result={"tools": tools}
@@ -576,6 +727,31 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                     filtered_result["note"] = registry_data.get("note")
                 
                 result = {"content": [{"type": "text", "text": json.dumps(filtered_result, indent=2)}]}
+            
+            elif tool_name == "mqtt_publish":
+                mqtt_result = await mqtt_publish(
+                    topic=arguments["topic"],
+                    payload=arguments["payload"],
+                    broker=arguments.get("broker"),
+                    port=arguments.get("port"),
+                    username=arguments.get("username"),
+                    password=arguments.get("password"),
+                    qos=arguments.get("qos", 0),
+                    retain=arguments.get("retain", False)
+                )
+                result = {"content": [{"type": "text", "text": json.dumps(mqtt_result, indent=2)}]}
+            
+            elif tool_name == "mqtt_subscribe":
+                mqtt_result = await mqtt_subscribe(
+                    topic=arguments["topic"],
+                    broker=arguments.get("broker"),
+                    port=arguments.get("port"),
+                    username=arguments.get("username"),
+                    password=arguments.get("password"),
+                    timeout=arguments.get("timeout", 10),
+                    max_messages=arguments.get("max_messages", 10)
+                )
+                result = {"content": [{"type": "text", "text": json.dumps(mqtt_result, indent=2)}]}
                 
             else:
                 raise ValueError(f"Unknown tool: {tool_name}")

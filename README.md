@@ -7,9 +7,12 @@ A simple Model Context Protocol (MCP) server addon for Home Assistant that allow
 - **File Operations**: List, read, write, create, and delete files and directories
 - **Search**: Search for text patterns within files
 - **HA CLI Commands**: Execute Home Assistant CLI commands safely (optional)
+- **Entity Management**: List and filter Home Assistant entities, devices, and services
+- **Historical Analysis**: Retrieve and analyze historical entity state changes for HVAC optimization and debugging
 - **Security**: API key authentication and path validation
 - **Configurable**: Set allowed directories, read-only mode, and file size limits
 - **Remote Access**: HTTP/SSE transport for remote MCP clients
+- **MQTT Integration**: Publish and subscribe to MQTT topics
 
 ## Installation
 
@@ -218,6 +221,117 @@ This is the **most efficient way** to retrieve all entities from Home Assistant.
 - ✅ **Unique ID Access**: Essential for matching entities to device topics
 - ✅ **Registry-Only Data**: Includes information not available in entity states
 - ✅ **Pagination Support**: Control response size with limit and offset parameters
+
+### Historical Entity Data Analysis
+
+The `get_ha_entity_history` tool provides comprehensive historical state analysis for Home Assistant entities. This is essential for:
+
+- **HVAC System Analysis**: Monitor heating/cooling patterns and efficiency
+- **Automation Debugging**: Track state changes to identify timing issues
+- **Performance Monitoring**: Analyze system behavior over time
+- **Energy Optimization**: Understand usage patterns and inefficiencies
+- **Predictive Maintenance**: Identify unusual patterns that might indicate problems
+
+**`get_ha_entity_history` Tool:**
+
+**Parameters:**
+- `entity_id` (required): Target entity ID (e.g., 'sensor.diyless_thermostat_1_ch_temperature')
+- `start_time` (optional): Start time in ISO 8601 format or relative format ('-6h', '-24h', '-7d'). Default: 12 hours ago
+- `end_time` (optional): End time in ISO 8601 format or 'now'. Default: current time
+- `limit` (optional): Maximum number of state changes to return. Default: 1000
+- `minimal_change` (optional): For numeric sensors, filter out changes smaller than this value
+
+**Time Format Support:**
+```bash
+# Relative formats (recommended)
+"-6h"    # 6 hours ago
+"-24h"   # 24 hours ago
+"-7d"    # 7 days ago
+"-2w"    # 2 weeks ago
+
+# ISO 8601 formats
+"2024-01-06T10:00:00Z"         # UTC time
+"2024-01-06T10:00:00+01:00"    # With timezone
+"now"                          # Current time
+```
+
+**Example Usage:**
+
+```bash
+# Analyze thermostat temperature over last 6 hours
+get_ha_entity_history(
+    entity_id="sensor.diyless_thermostat_1_ch_temperature",
+    start_time="-6h",
+    minimal_change=0.1  # Filter out noise < 0.1°C
+)
+
+# Monitor heating system efficiency (24 hours)
+get_ha_entity_history(
+    entity_id="binary_sensor.flame_sensor",
+    start_time="-24h",
+    limit=500
+)
+
+# Debug automation timing issues
+get_ha_entity_history(
+    entity_id="switch.heating_pump",
+    start_time="-12h",
+    end_time="now"
+)
+```
+
+**Response Format:**
+```json
+{
+    "entity_id": "sensor.temperature",
+    "query_period": {
+        "start": "2024-01-06T04:00:00Z",
+        "end": "2024-01-06T10:00:00Z", 
+        "duration_hours": 6.0
+    },
+    "total_changes": 45,
+    "state_changes": [
+        {
+            "timestamp": "2024-01-06T04:15:23Z",
+            "state": "21.5",
+            "numeric_value": 21.5,
+            "unit": "°C",
+            "friendly_name": "Living Room Temperature"
+        }
+    ],
+    "statistics": {
+        "type": "numeric",
+        "total_changes": 45,
+        "changes_per_hour": 7.5,
+        "value_statistics": {
+            "min": 20.8,
+            "max": 22.1, 
+            "average": 21.4,
+            "total_variation": 1.3
+        },
+        "unit": "°C"
+    }
+}
+```
+
+**Key Features:**
+- **Flexible Time Ranges**: Support for both relative and absolute time specifications
+- **Smart Filtering**: Optional minimal_change parameter to reduce noise in sensor data
+- **Statistical Analysis**: Automatic calculation of min, max, average, and change frequency
+- **Multiple Data Types**: Works with numeric sensors, binary sensors, and text-based entities
+- **Error Handling**: Graceful handling of non-existent entities and API failures
+- **Performance Optimized**: Uses Home Assistant's efficient history API with pagination
+
+**Use Cases:**
+1. **Heating System Analysis**: Track temperature modulation patterns and heating cycles
+2. **Energy Optimization**: Analyze usage patterns to identify inefficiencies  
+3. **Automation Debugging**: Monitor state changes to identify timing issues
+4. **System Monitoring**: Track switching frequencies for predictive maintenance
+5. **Performance Analysis**: Compare system behavior across different time periods
+
+For detailed examples and advanced use cases, see `/examples/ENTITY_HISTORY_EXAMPLES.md`.
+
+## File Operations
 
 **Parameters (all optional):**
 - `limit` (integer, default: 100): Maximum number of entities to return (set to 0 for count only)

@@ -4,6 +4,8 @@ import logging
 import aiohttp
 import asyncio
 from typing import Dict, Any, Optional
+from datetime import datetime, timedelta
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -264,6 +266,265 @@ class SupervisorAPI:
             except Exception as fallback_error:
                 logger.error(f"Fallback also failed: {fallback_error}")
                 raise Exception(f"Failed to get entity registry: {str(e)}")
+
+    async def get_ha_entity_history(
+        self,
+        entity_id: str,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        limit: int = 1000,
+        minimal_change: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Get historical state changes for a Home Assistant entity.
+        
+        Args:
+            entity_id: Target entity ID (e.g., 'sensor.temperature')
+            start_time: Start time in ISO 8601 format or relative format ('-6h', '-24h', '-7d')
+            end_time: End time in ISO 8601 format or 'now'
+            limit: Maximum number of state changes to return
+            minimal_change: For numeric sensors, filter out changes smaller than this value
+            
+        Returns:
+            Dict containing historical state changes with timestamps, statistics, and metadata
+        """
+        try:
+            # Parse and validate time parameters
+            start_dt, end_dt = self._parse_time_parameters(start_time, end_time)
+            
+            # Format timestamps for Home Assistant API
+            start_str = start_dt.isoformat() + "Z"
+            end_str = end_dt.isoformat() + "Z"
+            
+            # Make API call to get history
+            endpoint = f"/history/period/{start_str}"
+            params = {
+                "filter_entity_id": entity_id,
+                "end_time": end_str
+            }
+            
+            # Build URL with query parameters
+            query_string = "&".join(f"{k}={v}" for k, v in params.items())
+            full_endpoint = f"{endpoint}?{query_string}"
+            
+            logger.info(f"Requesting entity history: {entity_id} from {start_str} to {end_str}")
+            
+            history_raw = await self.call_ha_api("GET", full_endpoint)
+            
+            # Process the history data
+            if not history_raw or not isinstance(history_raw, list) or len(history_raw) == 0:
+                return {
+                    "entity_id": entity_id,
+                    "query_period": {
+                        "start": start_str,
+                        "end": end_str
+                    },
+                    "total_changes": 0,
+                    "state_changes": [],
+                    "statistics": None,
+                    "error": "No historical data found for the specified period"
+                }
+            
+            # Extract state changes from the nested structure
+            entity_states = history_raw[0] if len(history_raw) > 0 else []
+            
+            # Process and filter state changes
+            processed_changes = self._process_state_changes(
+                entity_states, 
+                minimal_change=minimal_change,
+                limit=limit
+            )
+            
+            # Calculate statistics for numeric sensors
+            statistics = self._calculate_statistics(processed_changes, start_dt, end_dt)
+            
+            # Prepare response
+            result = {
+                "entity_id": entity_id,
+                "query_period": {
+                    "start": start_str,
+                    "end": end_str,
+                    "duration_hours": (end_dt - start_dt).total_seconds() / 3600
+                },
+                "total_changes": len(processed_changes),
+                "state_changes": processed_changes,
+                "statistics": statistics,
+                "query_metadata": {
+                    "limit_applied": limit,
+                    "minimal_change_filter": minimal_change,
+                    "timestamp": datetime.now().isoformat()
+                }
+            }
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"Error getting entity history for {entity_id}: {e}")
+            return {
+                "entity_id": entity_id,
+                "error": f"Failed to retrieve history: {str(e)}",
+                "query_period": {
+                    "start": start_time or "12 hours ago",
+                    "end": end_time or "now"
+                },
+                "total_changes": 0,
+                "state_changes": [],
+                "statistics": None
+            }
+
+    def _parse_time_parameters(self, start_time: Optional[str], end_time: Optional[str]) -> tuple:
+        """Parse start and end time parameters into datetime objects."""
+        now = datetime.now()
+        
+        # Parse end time
+        if not end_time or end_time.lower() == "now":
+            end_dt = now
+        else:
+            try:
+                # Try parsing as ISO format
+                end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError(f"Invalid end_time format: {end_time}")
+        
+        # Parse start time
+        if not start_time:
+            # Default to 12 hours ago
+            start_dt = now - timedelta(hours=12)
+        elif start_time.startswith("-"):
+            # Relative format like "-6h", "-24h", "-7d"
+            start_dt = self._parse_relative_time(start_time, now)
+        else:
+            try:
+                # Try parsing as ISO format
+                start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+            except ValueError:
+                raise ValueError(f"Invalid start_time format: {start_time}")
+        
+        # Validate time range
+        if start_dt >= end_dt:
+            raise ValueError("start_time must be before end_time")
+        
+        return start_dt, end_dt
+
+    def _parse_relative_time(self, relative_str: str, reference_time: datetime) -> datetime:
+        """Parse relative time strings like '-6h', '-24h', '-7d'."""
+        match = re.match(r"^-(\d+)([hdw])$", relative_str.lower())
+        if not match:
+            raise ValueError(f"Invalid relative time format: {relative_str}")
+        
+        amount, unit = match.groups()
+        amount = int(amount)
+        
+        if unit == "h":
+            return reference_time - timedelta(hours=amount)
+        elif unit == "d":
+            return reference_time - timedelta(days=amount)
+        elif unit == "w":
+            return reference_time - timedelta(weeks=amount)
+        else:
+            raise ValueError(f"Unsupported time unit: {unit}")
+
+    def _process_state_changes(
+        self, 
+        raw_states: list, 
+        minimal_change: Optional[float] = None, 
+        limit: int = 1000
+    ) -> list:
+        """Process and filter raw state changes from Home Assistant history."""
+        if not raw_states:
+            return []
+        
+        processed = []
+        previous_numeric_value = None
+        
+        for state_obj in raw_states[:limit]:  # Apply limit early
+            try:
+                state_info = {
+                    "timestamp": state_obj.get("last_changed"),
+                    "state": state_obj.get("state"),
+                    "attributes": state_obj.get("attributes", {})
+                }
+                
+                # Add friendly name if available
+                if "friendly_name" in state_obj.get("attributes", {}):
+                    state_info["friendly_name"] = state_obj["attributes"]["friendly_name"]
+                
+                # Add unit of measurement if available
+                if "unit_of_measurement" in state_obj.get("attributes", {}):
+                    state_info["unit"] = state_obj["attributes"]["unit_of_measurement"]
+                
+                # Apply minimal change filter for numeric values
+                if minimal_change is not None:
+                    try:
+                        numeric_value = float(state_obj.get("state", 0))
+                        
+                        if previous_numeric_value is not None:
+                            change = abs(numeric_value - previous_numeric_value)
+                            if change < minimal_change:
+                                continue  # Skip this state change
+                        
+                        state_info["numeric_value"] = numeric_value
+                        previous_numeric_value = numeric_value
+                        
+                    except (ValueError, TypeError):
+                        # Not a numeric sensor, include all changes
+                        pass
+                
+                processed.append(state_info)
+                
+            except Exception as e:
+                logger.warning(f"Error processing state change: {e}")
+                continue
+        
+        return processed
+
+    def _calculate_statistics(
+        self, 
+        state_changes: list, 
+        start_time: datetime, 
+        end_time: datetime
+    ) -> Optional[Dict[str, Any]]:
+        """Calculate statistics for numeric sensor data."""
+        if not state_changes:
+            return None
+        
+        # Extract numeric values
+        numeric_values = []
+        for change in state_changes:
+            if "numeric_value" in change:
+                numeric_values.append(change["numeric_value"])
+        
+        if not numeric_values:
+            return {
+                "type": "non_numeric",
+                "total_changes": len(state_changes),
+                "time_period_hours": (end_time - start_time).total_seconds() / 3600,
+                "changes_per_hour": len(state_changes) / max((end_time - start_time).total_seconds() / 3600, 1)
+            }
+        
+        # Calculate numeric statistics
+        duration_hours = (end_time - start_time).total_seconds() / 3600
+        
+        statistics = {
+            "type": "numeric",
+            "total_changes": len(state_changes),
+            "numeric_changes": len(numeric_values),
+            "time_period_hours": duration_hours,
+            "changes_per_hour": len(state_changes) / max(duration_hours, 1),
+            "value_statistics": {
+                "min": min(numeric_values),
+                "max": max(numeric_values),
+                "average": sum(numeric_values) / len(numeric_values),
+                "first_value": numeric_values[0],
+                "last_value": numeric_values[-1],
+                "total_variation": max(numeric_values) - min(numeric_values)
+            }
+        }
+        
+        # Add unit if available
+        if state_changes and "unit" in state_changes[0]:
+            statistics["unit"] = state_changes[0]["unit"]
+        
+        return statistics
     
     async def get_ha_services(self) -> Dict[str, Any]:
         """Get all Home Assistant services."""

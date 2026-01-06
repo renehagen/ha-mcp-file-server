@@ -7,7 +7,7 @@ from typing import Dict, List, Any, Optional, Union
 from fastapi import FastAPI, HTTPException, Request, Query
 from pydantic import BaseModel
 import uvicorn
-from datetime import datetime
+from datetime import datetime, timedelta
 import paho.mqtt.client as mqtt
 import time
 
@@ -549,6 +549,37 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                             },
                             "required": []
                         }
+                    },
+                    {
+                        "name": "get_ha_entity_history",
+                        "description": "Get historical state changes for Home Assistant entities (requires MCP_ENABLE_HA_CLI=true). Essential for analyzing heating systems, HVAC performance, automation debugging, and system optimization. Returns state changes with timestamps, statistical analysis for numeric sensors, and performance metrics.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "entity_id": {
+                                    "type": "string",
+                                    "description": "Target entity ID (e.g., 'sensor.diyless_thermostat_1_ch_temperature', 'binary_sensor.flame_sensor')"
+                                },
+                                "start_time": {
+                                    "type": "string",
+                                    "description": "Start time in ISO 8601 format or relative format ('-6h', '-24h', '-7d'). Default: 12 hours ago"
+                                },
+                                "end_time": {
+                                    "type": "string",
+                                    "description": "End time in ISO 8601 format or 'now'. Default: current time"
+                                },
+                                "limit": {
+                                    "type": "integer",
+                                    "description": "Maximum number of state changes to return. Default: 1000",
+                                    "default": 1000
+                                },
+                                "minimal_change": {
+                                    "type": "number",
+                                    "description": "For numeric sensors, filter out changes smaller than this value (e.g., 0.1 for temperature sensors to reduce noise)"
+                                }
+                            },
+                            "required": ["entity_id"]
+                        }
                     }
                 ])
             
@@ -727,6 +758,20 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                     filtered_result["note"] = registry_data.get("note")
                 
                 result = {"content": [{"type": "text", "text": json.dumps(filtered_result, indent=2)}]}
+            
+            elif tool_name == "get_ha_entity_history":
+                if not ENABLE_HA_CLI:
+                    raise Exception("HA CLI commands are disabled. Set MCP_ENABLE_HA_CLI=true to enable.")
+                
+                supervisor_api = SupervisorAPI()
+                history_data = await supervisor_api.get_ha_entity_history(
+                    entity_id=arguments["entity_id"],
+                    start_time=arguments.get("start_time"),
+                    end_time=arguments.get("end_time"),
+                    limit=arguments.get("limit", 1000),
+                    minimal_change=arguments.get("minimal_change")
+                )
+                result = {"content": [{"type": "text", "text": json.dumps(history_data, indent=2)}]}
             
             elif tool_name == "mqtt_publish":
                 mqtt_result = await mqtt_publish(

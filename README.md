@@ -7,8 +7,12 @@ A simple Model Context Protocol (MCP) server addon for Home Assistant that allow
 - **File Operations**: List, read, write, create, and delete files and directories
 - **Search**: Search for text patterns within files
 - **HA CLI Commands**: Execute Home Assistant CLI commands safely (optional)
+- **HA Service Calls**: Call allowlisted Home Assistant services, including reloads and setpoints (optional)
 - **Entity Management**: List and filter Home Assistant entities, devices, and services
 - **Historical Analysis**: Retrieve and analyze historical entity state changes for HVAC optimization and debugging
+- **Log Diagnostics**: Query Home Assistant logs by time, level, logger, and message text
+- **MCP Add-on Management**: Inspect MCP runtime flags, add-on config, logs, stats, and restart the add-on
+- **Automation Debugging**: Validate YAML, run config checks, and read automation traces
 - **Security**: API key authentication and path validation
 - **Configurable**: Set allowed directories, read-only mode, and file size limits
 - **Remote Access**: HTTP/SSE transport for remote MCP clients
@@ -32,6 +36,7 @@ Configure the addon through the Home Assistant UI:
 - **read_only**: Enable read-only mode (default: false)
 - **max_file_size_mb**: Maximum file size in MB (default: 10)
 - **enable_ha_cli**: Enable HA CLI command execution (default: false)
+- **allowed_services**: Home Assistant services that AI clients may call when `enable_ha_cli` is true and `read_only` is false
 
 ## Usage
 
@@ -80,9 +85,106 @@ claude mcp add ha-files "http://homeassistant.local:6789/api/mcp?code=YOUR_API_K
 - `delete_path`: Delete a file or directory
 - `search_files`: Search for files containing specific text
 - `read_file_filtered`: Read file with filtering support for large files
+- `query_logs`: Query Home Assistant log files from the tail with time, level, logger, and text filters
+- `get_mcp_runtime_status`: Show effective runtime flags, including whether `MCP_ENABLE_HA_CLI` is active
+- `validate_yaml_file`: Validate YAML syntax, duplicate keys, and ambiguous values like `off`
+- `validate_automation_file`: Validate automation YAML structure and optionally run `check_config`
 - `execute_ha_cli`: Execute Home Assistant CLI commands (when enabled)
 - `list_ha_entities_devices`: List all Home Assistant entities, devices, and services via REST API (when enabled)
 - `get_ha_entity_registry`: Get all entities from the entity registry with platform and unique_id information (when enabled)
+- `get_ha_entity_history`: Get historical state changes, including relative minute windows and unavailable transitions (when enabled)
+- `get_ha_entities_history`: Get multi-entity history summaries with min/max/average, unavailable periods, and timelines (when enabled)
+- `get_states`: Get compact current-state snapshots for multiple entities in one API call (when enabled)
+- `get_mcp_addon_info`: Inspect the MCP add-on state, options/config, stats, runtime flags, and optional logs (when enabled)
+- `get_mcp_addon_logs`: Read recent logs for the MCP add-on (when enabled)
+- `restart_mcp_addon`: Restart the MCP add-on through Supervisor (when enabled and not read-only)
+- `call_service`: Call an allowlisted Home Assistant service through the WebSocket API (when enabled)
+- `reload_automations`, `reload_scripts`, `reload_template_entities`, `reload_python_scripts`: Reload HA configuration areas without a restart (when enabled)
+- `reload_integration`: Reload one Home Assistant config entry by `entry_id` (when enabled)
+- `check_config`: Run Home Assistant's core config check (when enabled)
+- `get_automation_trace`: Fetch and summarize recent automation traces (when enabled)
+
+### Home Assistant Service Calls, Reloads, and Traces
+
+When `enable_ha_cli` is `true`, the server can also use Home Assistant's REST and WebSocket APIs for controlled live operations. Write/reload tools are blocked when `read_only` is `true` and must match `allowed_services`.
+
+Default `allowed_services`:
+
+```yaml
+allowed_services:
+  - automation.reload
+  - automation.turn_on
+  - automation.turn_off
+  - script.reload
+  - template.reload
+  - python_script.reload
+  - homeassistant.check_config
+  - homeassistant.reload_config_entry
+  - homeassistant.update_entity
+  - number.set_value
+  - select.select_option
+```
+
+Examples:
+
+```text
+call_service(domain="number", service="set_value", target={"entity_id": "number.example"}, data={"value": 0})
+call_service(domain="homeassistant", service="check_config")
+reload_automations()
+reload_integration(entry_id="01J...")
+check_config()
+get_automation_trace(entity_id="automation.zendure_safety_stop", last_n=3)
+```
+
+Validation tools are read-only file/API operations. `validate_yaml_file` and `validate_automation_file` work against configured `allowed_dirs`; `validate_automation_file(run_check_config=true)` additionally calls Home Assistant's config check.
+
+### Diagnostics: Logs, States, and History
+
+`query_logs` reads the tail of a log file inside `allowed_dirs` and does not require `enable_ha_cli`. It is useful for quickly narrowing Home Assistant errors without returning the whole log file.
+
+```text
+query_logs(level=["ERROR", "WARNING"], since="-30m", limit=25)
+query_logs(logger_filter="custom_components.zendure", text_filter=["battery", "unavailable"], match_mode="all")
+query_logs(path="/config/home-assistant.log", text_filter="Traceback", max_bytes=1048576)
+```
+
+When `enable_ha_cli` is `true`, `get_states` returns a compact live snapshot for multiple entities in one REST call:
+
+```text
+get_states(
+  entity_ids=["sensor.battery_power", "number.zendure_manager_manual_power"],
+  attributes=["friendly_name", "unit_of_measurement"]
+)
+```
+
+`get_ha_entity_history` now accepts minute-based relative windows such as `-30m` and `-90m`, and can focus on unavailable edges:
+
+```text
+get_ha_entity_history(entity_id="sensor.battery_power", start_time="-90m", limit=200)
+get_ha_entity_history(entity_id="sensor.battery_power", start_time="-24h", unavailable_transitions_only=true)
+get_ha_entities_history(
+  entity_ids=["sensor.sma_power", "sensor.zendure_power", "sensor.zendure_state"],
+  start_time="-90m",
+  include_timeline=true,
+  include_state_changes=false
+)
+```
+
+More focused examples are in `/examples/BATCH2_DIAGNOSTICS_EXAMPLES.md`.
+
+### MCP Add-on Management
+
+`get_mcp_runtime_status` is always available and reports the effective runtime flags of the running container, including `ha_cli_enabled`, `read_only`, and `allowed_services`.
+
+When `enable_ha_cli` is `true`, add-on management tools use the Supervisor API:
+
+```text
+get_mcp_addon_info(include_logs=true, log_lines=100)
+get_mcp_addon_logs(lines=200)
+restart_mcp_addon()
+```
+
+`restart_mcp_addon` is blocked when `read_only` is `true`. It restarts the add-on itself, so the MCP request may disconnect while Supervisor restarts the container.
 
 ### Home Assistant CLI Commands
 
@@ -236,14 +338,17 @@ The `get_ha_entity_history` tool provides comprehensive historical state analysi
 
 **Parameters:**
 - `entity_id` (required): Target entity ID (e.g., 'sensor.diyless_thermostat_1_ch_temperature')
-- `start_time` (optional): Start time in ISO 8601 format or relative format ('-6h', '-24h', '-7d'). Default: 12 hours ago
+- `start_time` (optional): Start time in ISO 8601 format or relative format ('-30m', '-90m', '-6h', '-24h', '-7d'). Default: 12 hours ago
 - `end_time` (optional): End time in ISO 8601 format or 'now'. Default: current time
 - `limit` (optional): Maximum number of state changes to return. Default: 1000
 - `minimal_change` (optional): For numeric sensors, filter out changes smaller than this value
+- `unavailable_transitions_only` (optional): Only return transitions to or from `unavailable`
 
 **Time Format Support:**
 ```bash
 # Relative formats (recommended)
+"-30m"   # 30 minutes ago
+"-90m"   # 90 minutes ago
 "-6h"    # 6 hours ago
 "-24h"   # 24 hours ago
 "-7d"    # 7 days ago

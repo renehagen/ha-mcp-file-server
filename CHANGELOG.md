@@ -1,5 +1,39 @@
 # CHANGELOG
 
+## [1.5.0] - 2026-06-30
+
+### Added
+- **Log diagnostics** with `query_logs`, including tail reads, relative time windows, level filters, logger filters, text filters, and newest-first results.
+- **Live state snapshots** with `get_states` for fetching multiple entity states in one Home Assistant REST call.
+- **MCP add-on management** with `get_mcp_runtime_status`, `get_mcp_addon_info`, `get_mcp_addon_logs`, and `restart_mcp_addon`.
+- **Multi-entity history summaries** with `get_ha_entities_history`, including numeric statistics, unavailable periods, and a combined timeline.
+- **Minute-based relative history windows** such as `-30m` and `-90m`.
+- **Unavailable transition filtering** for `get_ha_entity_history` with `unavailable_transitions_only=true`.
+- `homeassistant.check_config` in the default service allowlist, alongside the richer `check_config` REST tool.
+- Unit tests for batch 2 log querying, state snapshots, add-on management wrappers, multi-entity history, minute parsing, and unavailable transition filtering.
+
+### Enhanced
+- Entity history responses now include local timestamp fields, previous state, and Home Assistant context IDs where available.
+- Log queries read only the requested tail bytes instead of scanning entire large log files.
+
+## [1.4.0] - 2026-06-30
+
+### Added
+- **Allowlisted Home Assistant service calls** with new `call_service` tool using the HA WebSocket API and returning context IDs where available.
+- **Reload tools** for automations, scripts, template entities, python scripts, and individual config entries.
+- **Config and YAML validation** with `check_config`, `validate_yaml_file`, and `validate_automation_file`.
+- **Automation trace inspection** with `get_automation_trace` for compact summaries of recent triggers, choices, variables, service calls, and errors.
+- **Service allowlist configuration** through `allowed_services` / `MCP_ALLOWED_SERVICES`.
+- Unit tests for allowlist enforcement, reload dispatch, YAML validation, and trace summarization.
+
+### Security
+- Home Assistant write/reload operations require `enable_ha_cli=true`, are blocked by `read_only=true`, and must match `allowed_services`.
+- YAML validation remains available in read-only mode; `validate_automation_file(run_check_config=true)` requires HA tools to be enabled.
+
+### Technical
+- Added shared REST and WebSocket helpers in `SupervisorAPI`.
+- Added `ruamel.yaml` for duplicate-key-aware YAML parsing and validation warnings for ambiguous plain scalars such as `off`.
+
 ## [1.3.0] - 2024-01-06
 
 ### Added

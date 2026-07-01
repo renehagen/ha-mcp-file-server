@@ -2,6 +2,7 @@ import os
 import json
 import aiofiles
 import asyncio
+import os
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 import logging
@@ -255,3 +256,35 @@ class FileHandler:
             raise ValueError(f"Cannot filter binary file: {path}")
         
         return results
+
+    async def read_tail_bytes(self, path: str, max_bytes: int = 2 * 1024 * 1024) -> Dict[str, Any]:
+        """Read the tail of a text file without scanning the entire file into memory."""
+        file_path = self._validate_path(path)
+        
+        if not file_path.exists():
+            raise FileNotFoundError(f"File not found: {path}")
+        
+        if not file_path.is_file():
+            raise ValueError(f"Path is not a file: {path}")
+
+        file_size = file_path.stat().st_size
+        read_size = min(max_bytes, file_size)
+        start_offset = max(file_size - read_size, 0)
+
+        with open(file_path, "rb") as f:
+            f.seek(start_offset)
+            raw_content = f.read(read_size)
+
+        text = raw_content.decode("utf-8", errors="replace")
+        lines = text.splitlines()
+        if start_offset > 0 and lines:
+            lines = lines[1:]
+
+        return {
+            "path": str(file_path),
+            "file_size": file_size,
+            "bytes_read": read_size,
+            "start_offset": start_offset,
+            "truncated_from_start": start_offset > 0,
+            "lines": lines,
+        }

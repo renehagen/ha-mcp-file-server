@@ -1,6 +1,6 @@
 name: "MCP File Server"
 description: "Model Context Protocol server for file management and HA CLI commands in Home Assistant"
-version: "1.5.0"
+version: "1.6.0"
 slug: "mcp_file_server"
 init: false
 arch:
@@ -31,6 +31,9 @@ options:
   read_only: false
   max_file_size_mb: 10
   enable_ha_cli: false
+  enable_backup_inspection: false
+  backup_allow_content: false
+  backup_max_download_mb: 128
   allowed_services:
     - "automation.reload"
     - "automation.turn_on"
@@ -50,6 +53,9 @@ schema:
   read_only: "bool"
   max_file_size_mb: "int(1,100)"
   enable_ha_cli: "bool"
+  enable_backup_inspection: "bool"
+  backup_allow_content: "bool"
+  backup_max_download_mb: "int(1,128)"
   allowed_services: [str]
 map:
   - config:rw

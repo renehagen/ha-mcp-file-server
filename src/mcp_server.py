@@ -1,17 +1,31 @@
 import os
 import json
 import logging
-import subprocess
 import asyncio
+import pathlib
 import re
+import secrets
+import shlex
+import tempfile
+from dataclasses import replace
 from typing import Dict, List, Any, Optional, Union
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import uvicorn
 from datetime import datetime, timedelta, timezone
 import paho.mqtt.client as mqtt
 import time
 
+from backup_inspector import (
+    BackupLimitError,
+    BackupLimits,
+    BackupValidationError,
+    normalize_patterns,
+    redact_sensitive_text,
+    scan_backup_archive_isolated,
+    validate_backup_slug,
+)
 from file_handler import FileHandler
 from supervisor_api import SupervisorAPI
 from yaml_validator import YAMLValidator
@@ -21,17 +35,29 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration from environment
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 PORT = int(os.getenv("MCP_PORT", "6789"))
 API_KEY = os.getenv("MCP_API_KEY", "")
 READ_ONLY = os.getenv("MCP_READ_ONLY", "false").lower() == "true"
 MAX_FILE_SIZE_MB = int(os.getenv("MCP_MAX_FILE_SIZE_MB", "10"))
 ENABLE_HA_CLI = os.getenv("MCP_ENABLE_HA_CLI", "false").lower() == "true"
+ENABLE_BACKUP_INSPECTION = os.getenv("MCP_ENABLE_BACKUP_INSPECTION", "false").lower() == "true"
+BACKUP_ALLOW_CONTENT = os.getenv("MCP_BACKUP_ALLOW_CONTENT", "false").lower() == "true"
 MCP_ADDON_SLUG = os.getenv("MCP_ADDON_SLUG", "local_mcp_file_server")
 MQTT_BROKER = os.getenv("MQTT_BROKER", "192.168.1.78")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 MQTT_USERNAME = os.getenv("MQTT_USERNAME", "")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
+
+MIN_BACKUP_API_KEY_LENGTH = 24
+MIN_BACKUP_API_KEY_UNIQUE_CHARACTERS = 8
+_configured_backup_download_mb = int(os.getenv("MCP_BACKUP_MAX_DOWNLOAD_MB", "128"))
+_backup_download_mb = max(1, min(_configured_backup_download_mb, 128))
+BACKUP_LIMITS = BackupLimits(
+    max_download_bytes=_backup_download_mb * 1024 * 1024,
+    max_total_download_bytes=min(_backup_download_mb * 2, 256) * 1024 * 1024,
+)
+_BACKUP_SEARCH_SEMAPHORE = asyncio.Semaphore(BACKUP_LIMITS.max_concurrency)
 
 DEFAULT_ALLOWED_SERVICES = [
     "automation.reload",
@@ -93,7 +119,8 @@ class JsonRpcResponse(BaseModel):
 
 def verify_function_key(code: str):
     """Verify function key like Azure Functions."""
-    if API_KEY and code != API_KEY:
+    supplied = "" if code is None else str(code)
+    if API_KEY and not secrets.compare_digest(supplied, API_KEY):
         raise HTTPException(status_code=401, detail="Invalid function key")
     return True
 
@@ -101,6 +128,47 @@ def require_ha_cli_enabled():
     """Ensure Home Assistant API tools are enabled."""
     if not ENABLE_HA_CLI:
         raise Exception("HA CLI commands are disabled. Set MCP_ENABLE_HA_CLI=true to enable.")
+
+def backup_api_key_is_strong() -> bool:
+    key = API_KEY.strip()
+    return (
+        len(key) >= MIN_BACKUP_API_KEY_LENGTH
+        and len(set(key)) >= MIN_BACKUP_API_KEY_UNIQUE_CHARACTERS
+        and key.casefold() not in {"change-me", "changeme", "your_api_key"}
+    )
+
+def backup_access_ready() -> bool:
+    """Return whether the runtime is safely configured to expose backup tools."""
+    return (
+        ENABLE_HA_CLI
+        and ENABLE_BACKUP_INSPECTION
+        and backup_api_key_is_strong()
+    )
+
+def require_backup_access(
+    *, include_content: bool = False, acknowledge_sensitive_content: bool = False
+) -> None:
+    """Require explicit enablement and strong authentication for backup access."""
+    if type(include_content) is not bool:
+        raise BackupValidationError("include_content must be a JSON boolean")
+    if type(acknowledge_sensitive_content) is not bool:
+        raise BackupValidationError(
+            "acknowledge_sensitive_content must be a JSON boolean"
+        )
+    require_ha_cli_enabled()
+    if not ENABLE_BACKUP_INSPECTION:
+        raise PermissionError("Backup inspection is disabled. Enable it explicitly first.")
+    if not backup_api_key_is_strong():
+        raise PermissionError(
+            "Backup inspection requires a non-placeholder API key of at least "
+            f"{MIN_BACKUP_API_KEY_LENGTH} characters with sufficient variation."
+        )
+    if include_content is True and not BACKUP_ALLOW_CONTENT:
+        raise PermissionError("Backup content return is disabled by configuration.")
+    if include_content is True and acknowledge_sensitive_content is not True:
+        raise PermissionError(
+            "Returning redacted backup snippets requires acknowledge_sensitive_content=true."
+        )
 
 def require_ha_write_allowed():
     """Ensure Home Assistant write operations are permitted."""
@@ -139,6 +207,270 @@ async def call_allowed_service(
 
 def _json_text_result(payload: Any) -> Dict[str, Any]:
     return {"content": [{"type": "text", "text": json.dumps(payload, indent=2)}]}
+
+def _extract_backup_items(response: Any) -> List[Dict[str, Any]]:
+    if not isinstance(response, dict):
+        return []
+    data = response.get("data") if isinstance(response.get("data"), dict) else response
+    items = (
+        data.get("backups") or data.get("snapshots")
+        or response.get("backups") or response.get("snapshots") or []
+    )
+    return [item for item in items if isinstance(item, dict)]
+
+def _summarize_backup_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Return useful metadata without exposing backup content/config lists."""
+    return {
+        "slug": item.get("slug"),
+        "name": item.get("name"),
+        "date": item.get("date") or item.get("created") or item.get("last_modified"),
+        "type": item.get("type"),
+        "size": item.get("size"),
+        "protected": item.get("protected"),
+        "encrypted": item.get("encrypted"),
+        "compressed": item.get("compressed"),
+    }
+
+def _backup_sort_key(item: Dict[str, Any]) -> str:
+    return str(item.get("date") or item.get("created") or item.get("last_modified") or "")
+
+def _bounded_backup_int(name: str, value: Any, minimum: int, maximum: int) -> int:
+    if isinstance(value, bool):
+        raise BackupValidationError(f"{name} must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise BackupValidationError(f"{name} must be an integer") from exc
+    if not minimum <= parsed <= maximum:
+        raise BackupLimitError(f"{name} must be between {minimum} and {maximum}")
+    return parsed
+
+async def list_ha_backups() -> Dict[str, Any]:
+    """List backup metadata behind the dedicated security gate."""
+    require_backup_access()
+    try:
+        response = await asyncio.wait_for(
+            SupervisorAPI().list_backups(), timeout=BACKUP_LIMITS.max_seconds
+        )
+    except asyncio.TimeoutError as exc:
+        raise BackupLimitError("backup listing exceeded its time limit") from exc
+    backups = sorted(_extract_backup_items(response), key=_backup_sort_key, reverse=True)
+    safe_backups = []
+    for item in backups[:BACKUP_LIMITS.max_backups]:
+        summary = _summarize_backup_item(item)
+        slug = summary.get("slug")
+        try:
+            summary["slug"] = validate_backup_slug(slug)
+        except BackupValidationError:
+            summary["slug"] = None
+            summary["metadata_error"] = "Supervisor returned an invalid backup slug"
+        safe_backups.append(summary)
+    return {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "count": len(safe_backups),
+        "available_count": len(backups),
+        "truncated": len(backups) > len(safe_backups),
+        "backups": safe_backups,
+    }
+
+async def get_ha_backup_info(slug: str) -> Dict[str, Any]:
+    """Return one backup's bounded, sanitized metadata only."""
+    slug = validate_backup_slug(slug)
+    listing = await list_ha_backups()
+    match = next((item for item in listing["backups"] if item.get("slug") == slug), None)
+    if match is None:
+        raise BackupValidationError("backup was not found in the bounded backup listing")
+    return {
+        "timestamp": listing["timestamp"],
+        "backup": match,
+    }
+
+async def _search_ha_backups_impl(
+    patterns: Union[str, List[str]],
+    backup_slugs: Optional[List[str]],
+    max_backups: int,
+    max_matches: int,
+    include_content: bool,
+    acknowledge_sensitive_content: bool,
+    context_lines: int,
+    match_mode: str,
+) -> Dict[str, Any]:
+    require_backup_access(
+        include_content=include_content,
+        acknowledge_sensitive_content=acknowledge_sensitive_content,
+    )
+    normalized_patterns = normalize_patterns(patterns, BACKUP_LIMITS)
+    if match_mode not in {"any", "all"}:
+        raise BackupValidationError("match_mode must be 'any' or 'all'")
+    max_backups = _bounded_backup_int(
+        "max_backups", max_backups, 1, BACKUP_LIMITS.max_backups
+    )
+    max_matches = _bounded_backup_int(
+        "max_matches", max_matches, 1, BACKUP_LIMITS.max_matches
+    )
+    context_lines = _bounded_backup_int(
+        "context_lines", context_lines, 0, BACKUP_LIMITS.max_context_lines
+    )
+
+    requested_slugs = [validate_backup_slug(slug) for slug in (backup_slugs or [])]
+    if len(requested_slugs) > BACKUP_LIMITS.max_backups:
+        raise BackupLimitError("too many backup slugs requested")
+    if len(set(requested_slugs)) != len(requested_slugs):
+        raise BackupValidationError("backup_slugs must not contain duplicates")
+
+    deadline = time.monotonic() + BACKUP_LIMITS.max_seconds
+    supervisor_api = SupervisorAPI()
+    try:
+        backups_response = await asyncio.wait_for(
+            supervisor_api.list_backups(),
+            timeout=max(0.001, deadline - time.monotonic()),
+        )
+    except asyncio.TimeoutError as exc:
+        raise BackupLimitError("backup request exceeded its time limit while listing backups") from exc
+    all_backups = sorted(
+        _extract_backup_items(backups_response), key=_backup_sort_key, reverse=True
+    )
+    requested_set = set(requested_slugs)
+    selected = [
+        item for item in all_backups
+        if not requested_set or item.get("slug") in requested_set
+    ][:max_backups]
+
+    aggregate_stats = {
+        "downloads": 0,
+        "downloaded_bytes": 0,
+        "archives_scanned": 0,
+        "archive_members": 0,
+        "unpacked_bytes_accounted": 0,
+        "files_scanned": 0,
+        "large_files_skipped": 0,
+        "non_text_files_skipped": 0,
+        "unsafe_members_skipped": 0,
+    }
+    all_matches: List[Dict[str, Any]] = []
+    all_errors: List[Dict[str, str]] = []
+    results = []
+    with tempfile.TemporaryDirectory(prefix="ha-backup-search-") as temp_dir:
+        for backup in selected:
+            if len(all_matches) >= max_matches:
+                break
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                all_errors.append({"error": "backup request exceeded its time limit"})
+                break
+            slug = validate_backup_slug(backup.get("slug"))
+            result = {"backup": _summarize_backup_item(backup), "matches": [], "errors": []}
+            archive_path = pathlib.Path(temp_dir) / f"{slug}.tar"
+            remaining_download = (
+                BACKUP_LIMITS.max_total_download_bytes - aggregate_stats["downloaded_bytes"]
+            )
+            if remaining_download <= 0:
+                error = {"backup_slug": slug, "error": "aggregate download-byte limit reached"}
+                result["errors"].append(error)
+                all_errors.append(error)
+                results.append(result)
+                break
+            try:
+                await supervisor_api.download_backup(
+                    slug,
+                    str(archive_path),
+                    max_bytes=min(BACKUP_LIMITS.max_download_bytes, remaining_download),
+                    timeout_seconds=min(remaining_seconds, BACKUP_LIMITS.max_seconds),
+                )
+                downloaded_bytes = archive_path.stat().st_size
+                if downloaded_bytes > min(BACKUP_LIMITS.max_download_bytes, remaining_download):
+                    raise BackupLimitError("downloaded backup exceeds the active byte limit")
+                aggregate_stats["downloads"] += 1
+                aggregate_stats["downloaded_bytes"] += downloaded_bytes
+
+                remaining_members = (
+                    BACKUP_LIMITS.max_archive_members - aggregate_stats["archive_members"]
+                )
+                remaining_unpacked = (
+                    BACKUP_LIMITS.max_unpacked_bytes
+                    - aggregate_stats["unpacked_bytes_accounted"]
+                )
+                if remaining_members <= 0 or remaining_unpacked <= 0:
+                    raise BackupLimitError("aggregate archive scan budget exhausted")
+                scan_seconds = deadline - time.monotonic()
+                if scan_seconds <= 0:
+                    raise BackupLimitError("backup request exceeded its time limit")
+                scan_limits = replace(
+                    BACKUP_LIMITS,
+                    max_archive_members=remaining_members,
+                    max_unpacked_bytes=remaining_unpacked,
+                    max_seconds=scan_seconds,
+                )
+                scan = await asyncio.to_thread(
+                    scan_backup_archive_isolated,
+                    archive_path,
+                    normalized_patterns,
+                    scan_limits,
+                    match_mode=match_mode,
+                    max_matches=max_matches - len(all_matches),
+                    include_content=include_content,
+                    context_lines=context_lines,
+                )
+                result["matches"] = scan["matches"]
+                result["errors"] = scan["errors"]
+                result["stats"] = scan["stats"]
+                result["truncated"] = scan["truncated"]
+                all_matches.extend(scan["matches"])
+                all_errors.extend(scan["errors"])
+                for key, value in scan["stats"].items():
+                    aggregate_stats[key] += value
+            except Exception as exc:
+                error = {"backup_slug": slug, "error": redact_sensitive_text(exc)}
+                result["errors"].append(error)
+                all_errors.append(error)
+            finally:
+                archive_path.unlink(missing_ok=True)
+            results.append(result)
+
+    missing = sorted(requested_set - {item.get("slug") for item in selected})
+    return {
+        "timestamp": datetime.now().astimezone().isoformat(),
+        "pattern_count": len(normalized_patterns),
+        "match_mode": match_mode,
+        "include_content": include_content,
+        "requested_backup_slugs": requested_slugs,
+        "missing_backup_slugs": missing,
+        "selected_backup_count": len(selected),
+        "total_matches": len(all_matches),
+        "stats": aggregate_stats,
+        "limits": BACKUP_LIMITS.public_dict(),
+        "errors": all_errors,
+        "results": results,
+    }
+
+async def search_ha_backups(
+    patterns: Union[str, List[str]],
+    backup_slugs: Optional[List[str]] = None,
+    max_backups: int = 5,
+    max_matches: int = 100,
+    include_content: bool = False,
+    acknowledge_sensitive_content: bool = False,
+    context_lines: int = 0,
+    match_mode: str = "any",
+) -> Dict[str, Any]:
+    """Run one bounded search at a time and reject excess concurrent work."""
+    try:
+        await asyncio.wait_for(_BACKUP_SEARCH_SEMAPHORE.acquire(), timeout=1.0)
+    except asyncio.TimeoutError as exc:
+        raise BackupLimitError("another backup search is already running") from exc
+    try:
+        try:
+            return await asyncio.wait_for(
+                _search_ha_backups_impl(
+                    patterns, backup_slugs, max_backups, max_matches, include_content,
+                    acknowledge_sensitive_content, context_lines, match_mode,
+                ),
+                timeout=BACKUP_LIMITS.max_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            raise BackupLimitError("backup request exceeded its hard time limit") from exc
+    finally:
+        _BACKUP_SEARCH_SEMAPHORE.release()
 
 def _extract_trace_runs(trace_list: Any) -> List[Dict[str, Any]]:
     """Normalize HA trace/list output into a list of run metadata."""
@@ -414,6 +746,10 @@ def get_mcp_runtime_status() -> Dict[str, Any]:
         "mcp_addon_slug": MCP_ADDON_SLUG,
         "read_only": READ_ONLY,
         "ha_cli_enabled": ENABLE_HA_CLI,
+        "backup_inspection_enabled": ENABLE_BACKUP_INSPECTION,
+        "backup_access_ready": backup_access_ready(),
+        "backup_content_return_enabled": BACKUP_ALLOW_CONTENT,
+        "backup_limits": BACKUP_LIMITS.public_dict(),
         "allowed_dirs": ALLOWED_DIRS,
         "allowed_services": ALLOWED_SERVICES,
         "max_file_size_mb": MAX_FILE_SIZE_MB,
@@ -691,80 +1027,88 @@ async def mqtt_subscribe(topic: str, broker: str = None, port: int = None,
         raise Exception(f"Failed to subscribe to MQTT topic: {str(e)}")
 
 
-async def execute_ha_cli_command(command: str, timeout: int = 30) -> Dict[str, Any]:
-    """Execute HA CLI command using Supervisor API."""
-    
-    if not ENABLE_HA_CLI:
-        raise Exception("HA CLI commands are disabled")
-    
-    # Safety validation - only allow specific safe commands
-    allowed_commands = [
-        "ha addons",
-        "ha supervisor",
-        "ha core",
-        "ha host",
-        "ha network",
-        "ha os",
-        "ha audio",
-        "ha multicast",
-        "ha dns",
-        "ha jobs",
-        "ha resolution",
-        "ha info",
-        "ha --help"
-    ]
-    
-    # Check if command starts with any allowed command
-    command_safe = False
-    for allowed in allowed_commands:
-        if command.strip().startswith(allowed):
-            command_safe = True
-            break
-    
-    if not command_safe:
-        raise Exception(f"Command not allowed. Allowed commands: {', '.join(allowed_commands)}")
-    
+def parse_ha_cli_argv(command: str) -> List[str]:
+    """Parse only the exact, read-only CLI forms implemented by SupervisorAPI."""
+    if not isinstance(command, str) or not command.strip() or len(command) > 512:
+        raise BackupValidationError("HA CLI command must be a non-empty string of at most 512 characters")
     try:
-        # Check if running in Home Assistant add-on environment
-        supervisor_token = os.getenv("SUPERVISOR_TOKEN")
-        
-        if supervisor_token:
-            # Use Supervisor API when running as an add-on
-            supervisor_api = SupervisorAPI()
-            return await supervisor_api.execute_ha_cli_equivalent(command)
-        else:
-            # Fallback to shell execution (for development/testing)
-            logger.warning("SUPERVISOR_TOKEN not found, falling back to shell execution")
-            
-            # Execute the command with timeout
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                limit=1024*1024  # 1MB limit for output
+        argv = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise BackupValidationError("HA CLI command contains invalid quoting") from exc
+
+    exact_forms = {
+        ("ha", "addons"),
+        ("ha", "supervisor", "logs"),
+        ("ha", "core", "logs"),
+        ("ha", "host", "logs"),
+    }
+    if tuple(argv) in exact_forms:
+        return argv
+    if len(argv) == 4 and argv[:3] in (["ha", "addons", "logs"], ["ha", "addons", "info"]):
+        validate_backup_slug(argv[3])
+        return argv
+    if argv in (["ha", "backups"], ["ha", "backups", "list"]):
+        require_backup_access()
+        return argv
+    if len(argv) == 4 and argv[:3] == ["ha", "backups", "info"]:
+        require_backup_access()
+        validate_backup_slug(argv[3])
+        return argv
+    raise PermissionError("HA CLI command is not one of the exact read-only allowlisted forms")
+
+async def execute_ha_cli_command(command: str, timeout: int = 30) -> Dict[str, Any]:
+    """Execute a strictly parsed HA CLI command without invoking a shell."""
+    require_ha_cli_enabled()
+    argv = parse_ha_cli_argv(command)
+    timeout = _bounded_backup_int("timeout", timeout, 1, 30)
+    normalized_command = shlex.join(argv)
+    try:
+        if argv[1] == "backups":
+            payload = (
+                await get_ha_backup_info(argv[3])
+                if len(argv) == 4
+                else await list_ha_backups()
             )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), 
-                    timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                process.kill()
-                await process.wait()
-                raise Exception(f"Command timed out after {timeout} seconds")
-            
             return {
-                "command": command,
-                "return_code": process.returncode,
-                "stdout": stdout.decode('utf-8', errors='replace'),
-                "stderr": stderr.decode('utf-8', errors='replace'),
-                "success": process.returncode == 0
+                "command": normalized_command,
+                "return_code": 0,
+                "stdout": json.dumps(payload, indent=2),
+                "stderr": "",
+                "success": True,
             }
-        
-    except Exception as e:
-        logger.error(f"Error executing HA CLI command '{command}': {e}")
-        raise Exception(f"Failed to execute command: {str(e)}")
+
+        if os.getenv("SUPERVISOR_TOKEN"):
+            return await SupervisorAPI().execute_ha_cli_equivalent(normalized_command)
+
+        logger.warning("SUPERVISOR_TOKEN not found; using strict non-shell HA CLI execution")
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            limit=1024 * 1024,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise TimeoutError(f"Command timed out after {timeout} seconds")
+
+        output_limit = 1024 * 1024
+        stdout_truncated = len(stdout) > output_limit
+        stderr_truncated = len(stderr) > output_limit
+        return {
+            "command": normalized_command,
+            "return_code": process.returncode,
+            "stdout": stdout[:output_limit].decode("utf-8", errors="replace"),
+            "stderr": stderr[:output_limit].decode("utf-8", errors="replace"),
+            "stdout_truncated": stdout_truncated,
+            "stderr_truncated": stderr_truncated,
+            "success": process.returncode == 0,
+        }
+    except Exception as exc:
+        logger.error("Safe HA CLI execution failed: %s", redact_sensitive_text(exc))
+        raise RuntimeError(f"Failed to execute command: {redact_sensitive_text(exc)}") from exc
 
 async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
     """Handle MCP JSON-RPC requests according to the Azure Functions pattern."""
@@ -1241,6 +1585,52 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                     }
                 }
                 ])
+
+            # Backup tools are hidden unless all security prerequisites are active.
+            if backup_access_ready():
+                tools.extend([
+                    {
+                        "name": "list_ha_backups",
+                        "description": "List bounded Home Assistant backup metadata. Requires explicit backup enablement and strong API-key authentication.",
+                        "inputSchema": {"type": "object", "properties": {}, "required": []},
+                    },
+                    {
+                        "name": "search_ha_backups",
+                        "description": "Search text-like files in Home Assistant backups with strict download, archive, time and concurrency limits.",
+                        "inputSchema": {
+                            "type": "object",
+                            "properties": {
+                                "patterns": {
+                                    "oneOf": [
+                                        {"type": "string", "maxLength": BACKUP_LIMITS.max_pattern_chars},
+                                        {
+                                            "type": "array",
+                                            "items": {"type": "string", "maxLength": BACKUP_LIMITS.max_pattern_chars},
+                                            "minItems": 1,
+                                            "maxItems": BACKUP_LIMITS.max_patterns,
+                                        },
+                                    ]
+                                },
+                                "backup_slugs": {
+                                    "type": "array",
+                                    "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$"},
+                                    "maxItems": BACKUP_LIMITS.max_backups,
+                                },
+                                "max_backups": {"type": "integer", "minimum": 1, "maximum": BACKUP_LIMITS.max_backups, "default": 5},
+                                "max_matches": {"type": "integer", "minimum": 1, "maximum": BACKUP_LIMITS.max_matches, "default": 100},
+                                "match_mode": {"type": "string", "enum": ["any", "all"], "default": "any"},
+                                "include_content": {"type": "boolean", "default": False},
+                                "acknowledge_sensitive_content": {
+                                    "type": "boolean",
+                                    "description": "Must be true when include_content=true; returned snippets are still redacted.",
+                                    "default": False,
+                                },
+                                "context_lines": {"type": "integer", "minimum": 0, "maximum": BACKUP_LIMITS.max_context_lines, "default": 0},
+                            },
+                            "required": ["patterns"],
+                        },
+                    },
+                ])
             
             # Add MQTT tools
             tools.extend([
@@ -1367,6 +1757,21 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
                     timeout=arguments.get("timeout", 30)
                 )
                 result = {"content": [{"type": "text", "text": json.dumps(command_result, indent=2)}]}
+
+            elif tool_name == "list_ha_backups":
+                result = _json_text_result(await list_ha_backups())
+
+            elif tool_name == "search_ha_backups":
+                result = _json_text_result(await search_ha_backups(
+                    patterns=arguments["patterns"],
+                    backup_slugs=arguments.get("backup_slugs"),
+                    max_backups=arguments.get("max_backups", 5),
+                    max_matches=arguments.get("max_matches", 100),
+                    include_content=arguments.get("include_content", False),
+                    acknowledge_sensitive_content=arguments.get("acknowledge_sensitive_content", False),
+                    context_lines=arguments.get("context_lines", 0),
+                    match_mode=arguments.get("match_mode", "any"),
+                ))
                 
             elif tool_name == "list_ha_entities_devices":
                 if not ENABLE_HA_CLI:
@@ -1598,21 +2003,24 @@ async def handle_mcp_request(request: JsonRpcRequest) -> JsonRpcResponse:
             )
     
     except Exception as e:
-        logger.error(f"Error handling MCP request: {e}")
+        safe_error = redact_sensitive_text(e)
+        logger.error("Error handling MCP request: %s", safe_error)
         return JsonRpcResponse(
             id=request.id,
             error={
                 "code": -32603,
-                "message": str(e)
+                "message": safe_error
             }
         )
 
-# GET endpoint for health check (like Azure Functions pattern)
+# GET endpoint for MCP capability discovery.
 @app.get("/api/mcp")
-async def mcp_get_endpoint(code: str = Query(None)):
-    """Health check endpoint like Azure Functions."""
+async def mcp_get_endpoint(
+    x_mcp_api_key: Optional[str] = Header(default=None, alias="X-MCP-API-Key"),
+):
+    """Return server metadata after header-based authentication."""
     if API_KEY:
-        verify_function_key(code)
+        verify_function_key(x_mcp_api_key)
     
     return {
         "name": "Home Assistant MCP File Server",
@@ -1625,14 +2033,16 @@ async def mcp_get_endpoint(code: str = Query(None)):
         "read_only": READ_ONLY,
         "allowed_dirs": ALLOWED_DIRS,
         "allowed_services": ALLOWED_SERVICES,
-        "ha_cli_enabled": ENABLE_HA_CLI
+        "ha_cli_enabled": ENABLE_HA_CLI,
+        "backup_inspection_enabled": ENABLE_BACKUP_INSPECTION,
+        "backup_access_ready": backup_access_ready()
     }
 
 # POST endpoint for MCP requests (like Azure Functions pattern)
 @app.post("/api/mcp")
 async def mcp_post_endpoint(
     request: Request,
-    code: str = Query(None)
+    x_mcp_api_key: Optional[str] = Header(default=None, alias="X-MCP-API-Key"),
 ):
     """
     Main MCP endpoint following Azure Functions pattern.
@@ -1641,7 +2051,7 @@ async def mcp_post_endpoint(
     
     # Verify function key if configured
     if API_KEY:
-        verify_function_key(code)
+        verify_function_key(x_mcp_api_key)
     
     try:
         # Parse JSON-RPC request
@@ -1682,6 +2092,8 @@ async def health_check():
         "allowed_dirs": ALLOWED_DIRS,
         "allowed_services": ALLOWED_SERVICES,
         "ha_cli_enabled": ENABLE_HA_CLI,
+        "backup_inspection_enabled": ENABLE_BACKUP_INSPECTION,
+        "backup_access_ready": backup_access_ready(),
         "mcp_endpoint": "/api/mcp"
     }
 
@@ -1691,8 +2103,18 @@ async def add_cors_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-MCP-API-Key"
     return response
+
+@app.middleware("http")
+async def reject_query_string_credentials(request: Request, call_next):
+    """Reject the retired URL credential before it reaches an endpoint."""
+    if "code" in request.query_params:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": "URL API keys are not supported; use X-MCP-API-Key"},
+        )
+    return await call_next(request)
 
 if __name__ == "__main__":
     logger.info(f"Starting MCP File Server on port {PORT}")
@@ -1702,5 +2124,8 @@ if __name__ == "__main__":
     logger.info(f"Allowed Home Assistant services: {ALLOWED_SERVICES}")
     logger.info(f"Function key configured: {'Yes' if API_KEY else 'No'}")
     logger.info(f"HA CLI enabled: {ENABLE_HA_CLI}")
+    logger.info(f"Backup inspection enabled: {ENABLE_BACKUP_INSPECTION}")
+    logger.info(f"Backup access safely configured: {backup_access_ready()}")
     
-    uvicorn.run(app, host="0.0.0.0", port=PORT)
+    # Do not emit raw request URLs: legacy clients may accidentally append a key.
+    uvicorn.run(app, host="0.0.0.0", port=PORT, access_log=False)

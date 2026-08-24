@@ -1,5 +1,29 @@
 # CHANGELOG
 
+## [1.6.0] - 2026-08-24
+
+### Added
+- Opt-in Home Assistant backup metadata listing and bounded archive search through Supervisor.
+- Dedicated limits for downloads, total request bytes, archive members, unpacked bytes, nesting, patterns, matches, time, and concurrency.
+- Negative and security tests for authentication, feature gates, content redaction, malformed archives, unsafe paths, limits, cleanup, and CLI injection attempts.
+
+### Security
+- Backup tools now require `enable_ha_cli`, explicit `enable_backup_inspection`, and an API key of at least 24 characters.
+- `/backup` is not mounted or included in the general file-tool allowlist.
+- `include_content=false` returns no snippets; explicitly enabled snippets are redacted.
+- Archive scanning runs in a disposable worker process outside the async request loop, is terminated at the wall-clock limit, and never extracts archive member paths.
+- The HA CLI dispatcher now validates exact argument vectors and uses no shell execution.
+- API keys are accepted only through the `X-MCP-API-Key` header, never through URL query strings.
+- Legacy `?code=` credentials are rejected and raw request-URL access logging is disabled.
+- Backup CLI-compatible output is routed through the same bounded metadata sanitizer as the MCP backup tools.
+- The hard backup-search deadline includes Supervisor listing and fallback calls.
+- Content-return and acknowledgement flags require literal JSON booleans; truthy strings and numbers are rejected.
+- Supervisor authentication headers and token prefixes are no longer logged.
+- FastAPI, Starlette, Pydantic, multipart, and aiohttp were updated to versions without known advisories in the release audit.
+
+### CI
+- Added Python 3.12 tests, bytecode compilation, dependency auditing, and shell syntax validation.
+
 ## [1.5.0] - 2026-06-30
 
 ### Added

@@ -10,6 +10,7 @@ A simple Model Context Protocol (MCP) server addon for Home Assistant that allow
 - **HA Service Calls**: Call allowlisted Home Assistant services, including reloads and setpoints (optional)
 - **Entity Management**: List and filter Home Assistant entities, devices, and services
 - **Historical Analysis**: Retrieve and analyze historical entity state changes for HVAC optimization and debugging
+- **Opt-in Backup Inspection**: List and search backups through Supervisor with strong authentication, redaction, and hard resource limits
 - **Log Diagnostics**: Query Home Assistant logs by time, level, logger, and message text
 - **MCP Add-on Management**: Inspect MCP runtime flags, add-on config, logs, stats, and restart the add-on
 - **Automation Debugging**: Validate YAML, run config checks, and read automation traces
@@ -36,6 +37,9 @@ Configure the addon through the Home Assistant UI:
 - **read_only**: Enable read-only mode (default: false)
 - **max_file_size_mb**: Maximum file size in MB (default: 10)
 - **enable_ha_cli**: Enable HA CLI command execution (default: false)
+- **enable_backup_inspection**: Explicitly expose backup tools (default: false; also requires `enable_ha_cli` and a varied, non-placeholder API key of at least 24 characters)
+- **backup_allow_content**: Permit explicitly acknowledged, redacted snippets in backup search results (default: false)
+- **backup_max_download_mb**: Per-backup download ceiling, from 1 through 128 MiB (default: 128)
 - **allowed_services**: Home Assistant services that AI clients may call when `enable_ha_cli` is true and `read_only` is false
 
 ## Usage
@@ -56,8 +60,8 @@ claude mcp add ha-files http://homeassistant.local:6789/api/mcp --transport http
 # or
 claude mcp add ha-files http://192.168.1.93:6789/api/mcp --transport http
 
-# With API key
-claude mcp add ha-files "http://homeassistant.local:6789/api/mcp?code=YOUR_API_KEY" --transport http
+# With API key, configure the client to send an X-MCP-API-Key header.
+# Never put the key in the URL/query string.
 ```
 
 **Note:** The `--transport http` flag is required for Claude Code CLI to properly recognize this as an HTTP-based MCP server.
@@ -69,7 +73,10 @@ claude mcp add ha-files "http://homeassistant.local:6789/api/mcp?code=YOUR_API_K
     "ha-files": {
       "transport": {
         "type": "http", 
-        "url": "http://homeassistant.local:6789/api/mcp"
+        "url": "http://homeassistant.local:6789/api/mcp",
+        "headers": {
+          "X-MCP-API-Key": "YOUR_API_KEY"
+        }
       }
     }
   }
@@ -90,6 +97,8 @@ claude mcp add ha-files "http://homeassistant.local:6789/api/mcp?code=YOUR_API_K
 - `validate_yaml_file`: Validate YAML syntax, duplicate keys, and ambiguous values like `off`
 - `validate_automation_file`: Validate automation YAML structure and optionally run `check_config`
 - `execute_ha_cli`: Execute Home Assistant CLI commands (when enabled)
+- `list_ha_backups`: List bounded backup metadata (only when securely enabled)
+- `search_ha_backups`: Search text-like archive members without extracting paths (only when securely enabled)
 - `list_ha_entities_devices`: List all Home Assistant entities, devices, and services via REST API (when enabled)
 - `get_ha_entity_registry`: Get all entities from the entity registry with platform and unique_id information (when enabled)
 - `get_ha_entity_history`: Get historical state changes, including relative minute windows and unavailable transitions (when enabled)
@@ -188,34 +197,47 @@ restart_mcp_addon()
 
 ### Home Assistant CLI Commands
 
-When `enable_ha_cli` is set to `true`, the server provides a secure way to execute Home Assistant CLI commands. This feature includes:
+When `enable_ha_cli` is set to `true`, the server exposes a small set of read-only Home Assistant CLI equivalents:
 
 **Safety Features:**
-- Only specific HA CLI commands are allowed (ha addons, ha supervisor, ha core, etc.)
-- Dangerous patterns are blocked (file operations, system commands, shell injection)
+- Only exact argument vectors are allowed; prefix matches and extra arguments are rejected
+- Local development fallback uses a non-shell process API with the already validated argument vector
 - Commands have a timeout limit (default 30 seconds)
 - Output is limited to 1MB to prevent resource exhaustion
 
 **Allowed Commands:**
-- `ha addons` - Manage add-ons (logs, info, stats, etc.)
-- `ha supervisor` - Supervisor information and operations
-- `ha core` - Home Assistant core operations
-- `ha host` - Host system information
-- `ha network` - Network configuration
-- `ha os` - Operating system operations
-- `ha audio` - Audio system management
-- `ha multicast` - Multicast DNS operations
-- `ha dns` - DNS configuration
-- `ha jobs` - View running jobs
-- `ha resolution` - View system resolution issues
-- `ha info` - General system information
-- `ha --help` - Help information
+- `ha addons`
+- `ha addons logs <slug>`
+- `ha addons info <slug>`
+- `ha supervisor logs`
+- `ha core logs`
+- `ha host logs`
+- `ha backups`, `ha backups list`, and `ha backups info <slug>` only when backup inspection is securely enabled
 
 **Example Usage:**
 ```
 execute_ha_cli("ha addons logs core_matter_server")
-execute_ha_cli("ha supervisor info")
+execute_ha_cli("ha supervisor logs")
 execute_ha_cli("ha core logs")
+```
+
+### Home Assistant Backup Inspection
+
+Backup access is off by default and `/backup` is neither mounted nor placed in the general file-tool allowlist. The dedicated tools download a selected backup through Supervisor into a temporary directory and always remove the temporary file.
+
+All three prerequisites are mandatory: `enable_ha_cli: true`, `enable_backup_inspection: true`, and a varied, non-placeholder API key of at least 24 characters. The tools are omitted from `tools/list` until those conditions are met. Returning snippets additionally requires `backup_allow_content: true`, the literal JSON boolean `include_content: true`, and the literal JSON boolean `acknowledge_sensitive_content: true`; string or numeric lookalikes are rejected. Even then, common passwords, credentials, tokens, API keys, bearer values, URL credentials, JWTs, long token-like values, and complete private-key blocks are redacted. With `include_content: false`, results contain only archive paths and line numbers—no snippets.
+
+The scanner uses a single concurrent slot and fixed ceilings for request time, backup count, download bytes, archive members, aggregate unpacked bytes, nesting depth, text-file bytes, patterns, context lines, and matches. Archive work runs in a disposable worker process outside the async server loop; the process is terminated if the hard wall-clock limit expires. The scanner never extracts member paths and skips unsafe paths, links, binary data, oversized members, corrupt archives, and unsupported protected/encrypted content with a structured error.
+
+```text
+list_ha_backups()
+search_ha_backups(patterns=["automation", "temperature"], max_backups=3)
+search_ha_backups(
+  patterns="entity_id",
+  backup_slugs=["valid_backup_slug"],
+  include_content=true,
+  acknowledge_sensitive_content=true
+)
 ```
 
 ### Home Assistant Entity & Device Management
@@ -636,6 +658,11 @@ AI can be incredibly helpful, but it's not infallible. Your backup is your safet
 ## Security
 
 - Always use an API key in production
+- Send the API key only in the `X-MCP-API-Key` request header; query-string keys are rejected so access logs cannot capture them in URLs
+- Uvicorn request-URL access logging is disabled to avoid recording keys from misconfigured legacy clients
+- Backup tools require a strong non-empty API key and explicit feature opt-in; they are never available anonymously
+- The backup directory is not mounted or generally allowlisted
+- Backup searches default to location-only matches and redact sensitive values when snippets are explicitly enabled
 - The server validates all paths to prevent directory traversal
 - Only directories listed in `allowed_dirs` can be accessed
 - Consider using read-only mode if write access is not needed

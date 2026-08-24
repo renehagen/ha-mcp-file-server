@@ -2,10 +2,15 @@ import os
 import json
 import logging
 import aiohttp
+import aiofiles
 import asyncio
+import pathlib
+import time
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 import re
+
+from backup_inspector import BackupLimitError, redact_sensitive_text, validate_backup_slug
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +24,7 @@ class SupervisorAPI:
         if not self.token:
             raise ValueError("SUPERVISOR_TOKEN environment variable not set")
         
-        logger.info(f"SupervisorAPI initialized with token: {self.token[:10]}...")
+        logger.info("SupervisorAPI initialized with Supervisor authentication")
     
     def _get_headers(self) -> Dict[str, str]:
         """Get headers for Supervisor API requests."""
@@ -33,13 +38,17 @@ class SupervisorAPI:
         method: str,
         endpoint: str,
         data: Optional[Dict[str, Any]] = None,
-        expected_statuses: Optional[List[int]] = None
+        expected_statuses: Optional[List[int]] = None,
+        timeout_seconds: float = 30.0,
     ) -> Any:
         """Make a direct call to the Supervisor API."""
         url = f"{self.base_url}{endpoint}"
         expected_statuses = expected_statuses or [200, 201]
+        if not 0 < timeout_seconds <= 30:
+            raise BackupLimitError("Supervisor API timeout is outside the hard safety range")
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             if method.upper() == "GET":
                 async with session.get(url, headers=self._get_headers()) as response:
                     return await self._parse_ha_response(response, expected_statuses)
@@ -54,21 +63,24 @@ class SupervisorAPI:
         url = f"{self.base_url}/addons/{addon_slug}/logs"
         
         logger.info(f"Requesting addon logs from: {url}")
-        logger.debug(f"Using headers: {self._get_headers()}")
         
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=self._get_headers()) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    logger.error(f"Failed to get addon logs: {response.status} - {error_text}")
+                    safe_error = redact_sensitive_text(error_text)[:2000]
+                    logger.error(f"Failed to get addon logs: {response.status} - {safe_error}")
                     # Try to parse error details
                     try:
                         error_json = json.loads(error_text)
                         if 'message' in error_json:
-                            raise Exception(f"Failed to get addon logs: {response.status} - {error_json['message']}")
+                            raise Exception(
+                                f"Failed to get addon logs: {response.status} - "
+                                f"{redact_sensitive_text(error_json['message'])[:2000]}"
+                            )
                     except:
                         pass
-                    raise Exception(f"Failed to get addon logs: {response.status} - {error_text}")
+                    raise Exception(f"Failed to get addon logs: {response.status} - {safe_error}")
                 
                 return await response.text()
     
@@ -80,7 +92,10 @@ class SupervisorAPI:
             async with session.get(url, headers=self._get_headers()) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    raise Exception(f"Failed to get addon info: {response.status} - {error_text}")
+                    raise Exception(
+                        f"Failed to get addon info: {response.status} - "
+                        f"{redact_sensitive_text(error_text)[:2000]}"
+                    )
                 
                 return await response.json()
 
@@ -116,10 +131,97 @@ class SupervisorAPI:
             async with session.get(url, headers=self._get_headers()) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    logger.error(f"Failed to list addons: {response.status} - {error_text}")
-                    raise Exception(f"Failed to list addons: {response.status} - {error_text}")
+                    safe_error = redact_sensitive_text(error_text)[:2000]
+                    logger.error(f"Failed to list addons: {response.status} - {safe_error}")
+                    raise Exception(f"Failed to list addons: {response.status} - {safe_error}")
                 
                 return await response.json()
+
+    async def list_backups(self, *, timeout_seconds: float = 30.0) -> Dict[str, Any]:
+        """List Home Assistant backups, supporting current and legacy endpoints."""
+        if not 0 < timeout_seconds <= 30:
+            raise BackupLimitError("backup listing timeout is outside the hard safety range")
+        last_error = "Supervisor did not return a backup list"
+        deadline = time.monotonic() + timeout_seconds
+        for endpoint in ("/backups", "/snapshots"):
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                last_error = "backup listing exceeded its time limit"
+                break
+            try:
+                return await asyncio.wait_for(
+                    self.call_supervisor_api(
+                        "GET", endpoint, timeout_seconds=remaining_seconds
+                    ),
+                    timeout=remaining_seconds,
+                )
+            except asyncio.TimeoutError:
+                last_error = "backup listing exceeded its time limit"
+                break
+            except Exception as exc:
+                last_error = redact_sensitive_text(exc)
+                logger.warning("Backup listing endpoint %s failed", endpoint)
+        raise RuntimeError(f"Failed to list backups via Supervisor API: {last_error}")
+
+    async def download_backup(
+        self,
+        slug: str,
+        destination_path: str,
+        *,
+        max_bytes: int,
+        timeout_seconds: float,
+    ) -> Dict[str, Any]:
+        """Stream one backup to a controlled path with a hard byte ceiling."""
+        slug = validate_backup_slug(slug)
+        if not 1 <= max_bytes <= 128 * 1024 * 1024:
+            raise BackupLimitError("backup download limit is outside the hard safety range")
+        if not 0 < timeout_seconds <= 30:
+            raise BackupLimitError("backup download timeout is outside the hard safety range")
+
+        destination = pathlib.Path(destination_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        last_error = "Supervisor did not provide the backup"
+        deadline = time.monotonic() + timeout_seconds
+        for endpoint in (f"/backups/{slug}/download", f"/snapshots/{slug}/download"):
+            destination.unlink(missing_ok=True)
+            remaining_seconds = deadline - time.monotonic()
+            if remaining_seconds <= 0:
+                last_error = "backup download exceeded its time limit"
+                break
+            timeout = aiohttp.ClientTimeout(total=remaining_seconds)
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(
+                        f"{self.base_url}{endpoint}", headers=self._get_headers()
+                    ) as response:
+                        if response.status != 200:
+                            last_error = f"Supervisor returned HTTP {response.status}"
+                            logger.warning("Backup download endpoint %s returned HTTP %s", endpoint, response.status)
+                            continue
+
+                        bytes_written = 0
+                        async with aiofiles.open(destination, "wb") as output:
+                            async for chunk in response.content.iter_chunked(256 * 1024):
+                                bytes_written += len(chunk)
+                                if bytes_written > max_bytes:
+                                    raise BackupLimitError("backup download exceeded the byte limit")
+                                await output.write(chunk)
+                        return {
+                            "success": True,
+                            "slug": slug,
+                            "endpoint": endpoint,
+                            "bytes": bytes_written,
+                        }
+            except BackupLimitError:
+                destination.unlink(missing_ok=True)
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                destination.unlink(missing_ok=True)
+                last_error = redact_sensitive_text(exc)
+                logger.warning("Backup download endpoint %s failed", endpoint)
+
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(f"Failed to download backup: {last_error}")
     
     async def get_supervisor_logs(self) -> str:
         """Get Supervisor logs."""
@@ -129,7 +231,10 @@ class SupervisorAPI:
             async with session.get(url, headers=self._get_headers()) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    raise Exception(f"Failed to get supervisor logs: {response.status} - {error_text}")
+                    raise Exception(
+                        f"Failed to get supervisor logs: {response.status} - "
+                        f"{redact_sensitive_text(error_text)[:2000]}"
+                    )
                 
                 return await response.text()
     
@@ -141,7 +246,10 @@ class SupervisorAPI:
             async with session.get(url, headers=self._get_headers()) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    raise Exception(f"Failed to get core logs: {response.status} - {error_text}")
+                    raise Exception(
+                        f"Failed to get core logs: {response.status} - "
+                        f"{redact_sensitive_text(error_text)[:2000]}"
+                    )
                 
                 return await response.text()
     
@@ -153,7 +261,10 @@ class SupervisorAPI:
             async with session.get(url, headers=self._get_headers()) as response:
                 if response.status != 200:
                     error_text = await response.text()
-                    raise Exception(f"Failed to get host logs: {response.status} - {error_text}")
+                    raise Exception(
+                        f"Failed to get host logs: {response.status} - "
+                        f"{redact_sensitive_text(error_text)[:2000]}"
+                    )
                 
                 return await response.text()
     
@@ -185,8 +296,9 @@ class SupervisorAPI:
         """Parse HA API responses with consistent status and content handling."""
         response_text = await response.text()
         if response.status not in expected_statuses:
-            logger.error(f"Failed to call HA API: {response.status} - {response_text}")
-            raise Exception(f"Failed to call HA API: {response.status} - {response_text}")
+            safe_error = redact_sensitive_text(response_text)[:2000]
+            logger.error(f"Failed to call HA API: {response.status} - {safe_error}")
+            raise Exception(f"Failed to call HA API: {response.status} - {safe_error}")
 
         if not response_text:
             return {}
@@ -937,7 +1049,7 @@ class SupervisorAPI:
             raise ValueError(f"Invalid command format: {command}")
         
         try:
-            if parts[1] == "addons" and len(parts) >= 4 and parts[2] == "logs":
+            if parts[1] == "addons" and len(parts) == 4 and parts[2] == "logs":
                 # ha addons logs <addon_slug>
                 addon_slug = parts[3]
                 logs = await self.get_addon_logs(addon_slug)
@@ -949,7 +1061,7 @@ class SupervisorAPI:
                     "success": True
                 }
             
-            elif parts[1] == "addons" and len(parts) >= 4 and parts[2] == "info":
+            elif parts[1] == "addons" and len(parts) == 4 and parts[2] == "info":
                 # ha addons info <addon_slug>
                 addon_slug = parts[3]
                 info = await self.get_addon_info(addon_slug)
@@ -960,7 +1072,7 @@ class SupervisorAPI:
                     "stderr": "",
                     "success": True
                 }
-            
+
             elif parts[1] == "addons" and len(parts) == 2:
                 # ha addons (list)
                 addons = await self.list_addons()
@@ -972,7 +1084,7 @@ class SupervisorAPI:
                     "success": True
                 }
             
-            elif parts[1] == "supervisor" and len(parts) >= 3 and parts[2] == "logs":
+            elif parts[1] == "supervisor" and len(parts) == 3 and parts[2] == "logs":
                 # ha supervisor logs
                 logs = await self.get_supervisor_logs()
                 return {
@@ -983,7 +1095,7 @@ class SupervisorAPI:
                     "success": True
                 }
             
-            elif parts[1] == "core" and len(parts) >= 3 and parts[2] == "logs":
+            elif parts[1] == "core" and len(parts) == 3 and parts[2] == "logs":
                 # ha core logs
                 logs = await self.get_core_logs()
                 return {
@@ -994,7 +1106,7 @@ class SupervisorAPI:
                     "success": True
                 }
             
-            elif parts[1] == "host" and len(parts) >= 3 and parts[2] == "logs":
+            elif parts[1] == "host" and len(parts) == 3 and parts[2] == "logs":
                 # ha host logs
                 logs = await self.get_host_logs()
                 return {
@@ -1013,6 +1125,6 @@ class SupervisorAPI:
                 "command": command,
                 "return_code": 1,
                 "stdout": "",
-                "stderr": str(e),
+                "stderr": redact_sensitive_text(e),
                 "success": False
             }
